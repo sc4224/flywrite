@@ -1,0 +1,3 @@
+https://codex.flywire.ai/api/download?data_product=connections_no_threshold&data_version=783
+
+conda activate flywire

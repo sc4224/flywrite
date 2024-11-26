@@ -1,0 +1,3 @@
+pyro-ppl
+scipy
+pandas
