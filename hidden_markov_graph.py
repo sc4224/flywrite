@@ -5,10 +5,12 @@ import numpy as np
 from tqdm import tqdm
 
 # Constants
-K = 8      # Number of clusters
+K = 32      # Number of clusters
 d = 32       # Dimensionality of feature space
 batch_size = 512  # Size of minibatch
-num_epochs = 10
+num_epochs = 500
+num_e_updates = 10
+num_m_updates = None
 
 # Load the sparse matrix from `sparse_connectivity_matrix.npz`.
 # The sparse matrix is in the format of csr_matrix.
@@ -18,6 +20,7 @@ adj_matrix = load_npz("sparse_connectivity_matrix.npz")
 adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
 
 N = adj_matrix.shape[0]  # Number of nodes
+print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
 # Model parameters
 U_left = nn.Parameter(torch.randn(K, d))
@@ -93,7 +96,7 @@ def compute_q_probs(n_max_updates=None):
             (1 - moving_coeff) * torch.softmax(log_likelihood_node.t(), dim=-1)
 
 # M-step: Update U_left and U_right
-def m_step():
+def m_step(n_max_updates=None):
     optimizer = torch.optim.Adam([U_left, U_right], lr=0.01)
     perm = torch.randperm(N)
 
@@ -102,7 +105,13 @@ def m_step():
     final_loss = 0.0
 
     print("M-Step: Updating U_left and U_right...")
+    bi = 0
     for batch_start in tqdm(range(0, len(perm), batch_size)):
+        bi = bi + 1
+
+        if n_max_updates is not None and bi > n_max_updates:
+            break
+
         batch_end = min(batch_start + batch_size, len(perm))
         batch_indices = perm[batch_start:batch_end]
 
@@ -131,15 +140,19 @@ def m_step():
     print(f"M-step: Initial Loss = {initial_loss:.4f}, Final Loss = {final_loss:.4f}")
 
 # EM algorithm
-for epoch in range(num_epochs):
-    print(f"Epoch {epoch + 1}/{num_epochs}")
+try:
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
 
-    # E-step: Update q_probs explicitly using dense submatrices
-    compute_q_probs(n_max_updates=5)
-    print(f"Updated q_probs for E-step (sample): {q_probs[:5]}")
+        # E-step: Update q_probs explicitly using dense submatrices
+        compute_q_probs(n_max_updates=num_e_updates)
+        print(f"Updated q_probs for E-step (sample): {
+                torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
 
-    # M-step: Update U_left and U_right
-    m_step()
+        # M-step: Update U_left and U_right
+        m_step(n_max_updates=num_m_updates)
+except KeyboardInterrupt:
+    print("Training interrupted.")
 
 # Save results
 cluster_assignments = torch.argmax(q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
