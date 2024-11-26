@@ -146,8 +146,7 @@ try:
 
         # E-step: Update q_probs explicitly using dense submatrices
         compute_q_probs(n_max_updates=num_e_updates)
-        print(f"Updated q_probs for E-step (sample): {
-                torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
+        print(f"Updated q_probs for E-step (sample): {torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
 
         # M-step: Update U_left and U_right
         m_step(n_max_updates=num_m_updates)
