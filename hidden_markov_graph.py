@@ -40,6 +40,10 @@ def model(sampled_indices, observed_submatrix):
         # Latent cluster assignments
         Z = pyro.sample("Z", dist.Categorical(logits=torch.zeros(len(sampled_indices), K)))
     
+    # Feature matrix for each cluster
+    with pyro.plate("clusters", K):
+        U = pyro.sample("U", dist.Normal(torch.zeros(d), torch.ones(d)).to_event(1))
+    
     # Plate for pairwise interactions within the minibatch
     num_pairs = len(sampled_indices) ** 2
     with pyro.plate("pairs", num_pairs):
@@ -48,7 +52,6 @@ def model(sampled_indices, observed_submatrix):
         i_indices, j_indices = pairwise_indices[:, 0], pairwise_indices[:, 1]
         
         # Compute cluster embeddings
-        U = pyro.param("U", torch.randn(K, d), constraint=constraints.real)
         U_i = U[Z[i_indices]]
         U_j = U[Z[j_indices]]
         
@@ -62,10 +65,18 @@ def model(sampled_indices, observed_submatrix):
 
 # Guide definition
 def guide(sampled_indices, observed_submatrix):
+    # Plate for sampled nodes
     with pyro.plate("nodes", len(sampled_indices)):
         # Learnable parameters for variational distribution over Z
         q_logits = pyro.param("q_logits", torch.randn(N, K))
-        pyro.sample("Z", dist.Categorical(logits=q_logits[sampled_indices]))
+        Z = pyro.sample("Z", dist.Categorical(logits=q_logits[sampled_indices]))
+    
+    # Plate for clusters
+    with pyro.plate("clusters", K):
+        # Variational distribution over U
+        q_mu = pyro.param("q_mu", torch.randn(K, d))
+        q_sigma = pyro.param("q_sigma", torch.ones(K, d), constraint=constraints.positive)
+        U = pyro.sample("U", dist.Normal(q_mu, q_sigma).to_event(1))
 
 # Set up the optimizer and inference
 optimizer = Adam({"lr": 0.01})
@@ -88,7 +99,12 @@ with tqdm(total=num_steps, desc="Training Progress", unit="step") as pbar:
 q_logits = pyro.param("q_logits")
 Z_posterior = torch.argmax(q_logits, dim=1)
 
-# Save cluster assignments to a file
-output_file = "cluster_assignments.npy"
-np.save(output_file, Z_posterior.numpy())
-print(f"Inferred cluster assignments saved to {output_file}.")
+# Output the learned U
+q_mu = pyro.param("q_mu")
+q_sigma = pyro.param("q_sigma")
+U_posterior = q_mu  # Posterior mean as the point estimate
+
+# Save results to files
+np.save("cluster_assignments.npy", Z_posterior.numpy())
+np.save("U_posterior_mean.npy", U_posterior.numpy())
+print("Inferred cluster assignments and U posterior mean saved to files.")
