@@ -12,10 +12,14 @@ from tqdm import tqdm
 # Constants
 K = 256      # Number of clusters
 d = 10       # Dimensionality of feature space
+batch_size = 500  # Size of minibatch
 
-# load the sparse matrix from `sparse_connectivity_matrix.npz`.
-# the sparse matrix is in the format of csr_matrix.
+# Load the sparse matrix from `sparse_connectivity_matrix.npz`.
+# The sparse matrix is in the format of csr_matrix.
 sparse_matrix = load_npz("sparse_connectivity_matrix.npz")
+
+# Threshold the sparse matrix to obtain a binary adjacency matrix
+sparse_matrix.data = (sparse_matrix.data > 0).astype(np.int8)
 
 N = sparse_matrix.shape[0]  # Number of nodes
 
@@ -23,50 +27,60 @@ N = sparse_matrix.shape[0]  # Number of nodes
 def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
+# Minibatch sampler
+def sample_minibatch(sparse_matrix, batch_size):
+    sampled_indices = np.random.choice(N, size=batch_size, replace=False)
+    submatrix = sparse_matrix[sampled_indices, :][:, sampled_indices].toarray()
+    return sampled_indices, torch.tensor(submatrix, dtype=torch.float32)
+
 # Model definition
-def model(observed_sparse_matrix):
-    # Latent cluster assignments
-    Z = pyro.sample("Z", dist.Categorical(logits=torch.zeros(N, K)))
+def model(sampled_indices, observed_submatrix):
+    # Plate for sampled nodes
+    with pyro.plate("nodes", len(sampled_indices)):
+        # Latent cluster assignments
+        Z = pyro.sample("Z", dist.Categorical(logits=torch.zeros(len(sampled_indices), K)))
     
-    # Feature matrix for each cluster
-    U = pyro.param("U", torch.randn(K, d), constraint=constraints.real)
-    
-    # Iterate over all pairs of nodes
-    for i in range(observed_sparse_matrix.shape[0]):
-        row_start = observed_sparse_matrix.indptr[i]
-        row_end = observed_sparse_matrix.indptr[i + 1]
-        non_zero_columns = set(observed_sparse_matrix.indices[row_start:row_end])
+    # Plate for pairwise interactions within the minibatch
+    num_pairs = len(sampled_indices) ** 2
+    with pyro.plate("pairs", num_pairs):
+        # Compute pairwise indices
+        pairwise_indices = torch.cartesian_prod(torch.arange(len(sampled_indices)), torch.arange(len(sampled_indices)))
+        i_indices, j_indices = pairwise_indices[:, 0], pairwise_indices[:, 1]
         
-        for j in range(N):
-            if j in non_zero_columns:
-                obs = observed_sparse_matrix[i, j]
-            else:
-                obs = 0  # Implied no edge
-            
-            U_i = U[Z[i]]
-            U_j = U[Z[j]]
-            mu_ij = sigmoid((U_i * U_j).sum())
-            pyro.sample(f"W_{i}_{j}", dist.Bernoulli(mu_ij), obs=torch.tensor(obs, dtype=torch.float32))
+        # Compute cluster embeddings
+        U = pyro.param("U", torch.randn(K, d), constraint=constraints.real)
+        U_i = U[Z[i_indices]]
+        U_j = U[Z[j_indices]]
+        
+        # Pairwise interaction
+        pairwise_interaction = torch.einsum("bd,bd->b", U_i, U_j)  # Dot product along feature dimension
+        mu_ij = sigmoid(pairwise_interaction)
+        
+        # Flatten observed_submatrix and match to pairwise interactions
+        observed_flat = observed_submatrix.flatten()
+        pyro.sample("W", dist.Bernoulli(mu_ij), obs=observed_flat)
 
 # Guide definition
-def guide(observed_sparse_matrix):
-    # Learnable parameters for variational distribution over Z
-    q_logits = pyro.param("q_logits", torch.randn(N, K))
-    pyro.sample("Z", dist.Categorical(logits=q_logits))
-
-# Use csr_matrix for observed data
-observed_matrix = sparse_matrix
+def guide(sampled_indices, observed_submatrix):
+    with pyro.plate("nodes", len(sampled_indices)):
+        # Learnable parameters for variational distribution over Z
+        q_logits = pyro.param("q_logits", torch.randn(N, K))
+        pyro.sample("Z", dist.Categorical(logits=q_logits[sampled_indices]))
 
 # Set up the optimizer and inference
 optimizer = Adam({"lr": 0.01})
 svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
-# Training loop with a progress bar
+# Training loop with minibatching
 num_steps = 1000
 with tqdm(total=num_steps, desc="Training Progress", unit="step") as pbar:
     for step in range(num_steps):
-        loss = svi.step(observed_matrix)
-        if step % 100 == 0:
+        # Sample a minibatch
+        sampled_indices, submatrix = sample_minibatch(sparse_matrix, batch_size)
+        
+        # Perform one step of inference
+        loss = svi.step(sampled_indices, submatrix)
+        if step % 1 == 0:
             pbar.set_postfix({"Loss": f"{loss:.4f}"})
         pbar.update(1)
 
