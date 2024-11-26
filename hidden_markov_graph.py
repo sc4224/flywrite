@@ -1,122 +1,153 @@
-import pyro
-import pyro.distributions as dist
 import torch
+from torch import nn
+from scipy.sparse import csr_matrix, load_npz
 import numpy as np
-
-from torch.distributions import constraints
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
-from scipy.sparse import load_npz
 from tqdm import tqdm
 
 # Constants
-K = 64      # Number of clusters
+K = 8      # Number of clusters
 d = 32       # Dimensionality of feature space
 batch_size = 512  # Size of minibatch
+num_epochs = 10
 
 # Load the sparse matrix from `sparse_connectivity_matrix.npz`.
 # The sparse matrix is in the format of csr_matrix.
-sparse_matrix = load_npz("sparse_connectivity_matrix.npz")
+adj_matrix = load_npz("sparse_connectivity_matrix.npz")
 
 # Threshold the sparse matrix to obtain a binary adjacency matrix
-sparse_matrix.data = (sparse_matrix.data > 0).astype(np.int8)
+adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
 
-N = sparse_matrix.shape[0]  # Number of nodes
+N = adj_matrix.shape[0]  # Number of nodes
 
-# Sigmoid function
+# Model parameters
+U_left = nn.Parameter(torch.randn(K, d))
+U_right = nn.Parameter(torch.randn(K, d))
+
+# Variational parameters for Z (initialize uniform)
+q_probs = torch.ones(N, K) / K  # Posterior probabilities of Z
+moving_coeff = 0.9  # Moving average coefficient for q_probs
+
 def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
-# Minibatch sampler
-def sample_minibatch(sparse_matrix, batch_size):
-    sampled_indices = np.random.choice(N, size=batch_size, replace=False)
-    submatrix = sparse_matrix[sampled_indices, :][:, sampled_indices].toarray()
-    return sampled_indices, torch.tensor(submatrix, dtype=torch.float32)
+def compute_dense_submatrix(indices, rows_only=False):
+    """
+    Given a set of indices, extract a dense submatrix from the sparse adjacency matrix.
+    """
+    if rows_only:
+        sub_adj = adj_matrix[indices, :].toarray()
+    else:
+        sub_adj = adj_matrix[indices, :][:, indices].toarray()
+    return torch.tensor(sub_adj, dtype=torch.float32)
 
-# Model definition
-def model(sampled_indices, observed_submatrix):
-    # Plate for sampled nodes
-    with pyro.plate("nodes", len(sampled_indices)):
-        # Latent cluster assignments
-        Z = pyro.sample("Z", dist.Categorical(logits=torch.zeros(len(sampled_indices), K)))
-    
-    # Feature matrix for each cluster
-    with pyro.plate("clusters", K):
-        U_left = pyro.sample("U_left", dist.Normal(torch.zeros(d), torch.ones(d)).to_event(1))
-        U_right = pyro.sample("U_right", dist.Normal(torch.zeros(d), torch.ones(d)).to_event(1))
-    
-    # Plate for pairwise interactions within the minibatch
-    num_pairs = len(sampled_indices) ** 2
-    with pyro.plate("pairs", num_pairs):
-        # Compute pairwise indices
-        pairwise_indices = torch.cartesian_prod(torch.arange(len(sampled_indices)), torch.arange(len(sampled_indices)))
-        i_indices, j_indices = pairwise_indices[:, 0], pairwise_indices[:, 1]
-        
-        # Compute cluster embeddings
-        U_i = U_left[Z[i_indices]]
-        U_j = U_right[Z[j_indices]]
-        
-        # Pairwise interaction
-        pairwise_interaction = torch.einsum("bd,bd->b", U_i, U_j)  # Dot product along feature dimension
-        mu_ij = sigmoid(pairwise_interaction)
-        
-        # Flatten observed_submatrix and match to pairwise interactions
-        observed_flat = observed_submatrix.flatten()
-        pyro.sample("W", dist.Bernoulli(mu_ij), obs=observed_flat)
+# E-step: Update q_probs explicitly using dense submatrices
+def compute_q_probs(n_max_updates=None):
+    """
+    Compute q_probs using dense submatrices for tractability, with shuffled node indices.
+    Optimized using batched matrix operations.
+    """
+    global q_probs
+    log_q = torch.zeros(N, K)
 
-# Guide definition
-def guide(sampled_indices, observed_submatrix):
-    # Plate for sampled nodes
-    with pyro.plate("nodes", len(sampled_indices)):
-        # Learnable parameters for variational distribution over Z
-        q_logits = pyro.param("q_logits", torch.randn(N, K))
-        Z = pyro.sample("Z", dist.Categorical(logits=q_logits[sampled_indices]))
-    
-    # Plate for clusters
-    with pyro.plate("clusters", K):
-        # Variational distribution over U
-        q_mu_left = pyro.param("q_mu_left", torch.randn(K, d))
-        q_sigma_left = pyro.param("q_sigma_left", torch.ones(K, d), 
-                                  constraint=constraints.positive)
-        q_mu_right = pyro.param("q_mu_right", torch.randn(K, d))
-        q_sigma_right = pyro.param("q_sigma_right", torch.ones(K, d), 
-                                   constraint=constraints.positive)
-        U_left = pyro.sample("U_left", dist.Normal(q_mu_left, q_sigma_left).to_event(1))
-        U_right = pyro.sample("U_right", dist.Normal(q_mu_right, q_sigma_right).to_event(1))
+    # Shuffle indices to mix different vertices
+    perm = torch.randperm(N)
 
-# Set up the optimizer and inference
-optimizer = Adam({"lr": 0.01})
-svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+    # Compute logits for all cluster assignments (z_i, z_j)
+    logits = torch.mm(U_left, U_right.t())  # Shape: (K, K)
+    logits = logits.unsqueeze(2).unsqueeze(3)  # Shape: (K, K, 1, 1)
 
-# Training loop with minibatching
-try:
-    num_steps = 1000
-    with tqdm(total=num_steps, desc="Training Progress", unit="step") as pbar:
-        for step in range(num_steps):
-            # Sample a minibatch
-            sampled_indices, submatrix = sample_minibatch(sparse_matrix, batch_size)
-            
-            # Perform one step of inference
-            loss = svi.step(sampled_indices, submatrix)
-            if step % 1 == 0:
-                pbar.set_postfix({"Loss": f"{loss:.4f}"})
-            pbar.update(1)
-except KeyboardInterrupt:
-    print("Training interrupted.")
+    # Compute probabilities for all edges and non-edges
+    prob_edges = sigmoid(logits)  # Shape: (K, K, 1, 1)
+    log_prob_edges = torch.log(prob_edges + 1e-9)  # Shape: (K, K, 1, 1)
+    log_prob_no_edges = torch.log(1 - prob_edges + 1e-9)  # Shape: (K, K, 1, 1)
 
-# Output the learned cluster assignments
-q_logits = pyro.param("q_logits")
-Z_posterior = torch.argmax(q_logits, dim=1)
+    # Process in minibatches
+    print("E-Step: Computing q_probs using dense submatrices...")
 
-# Output the learned U
-q_mu_left = pyro.param("q_mu_left")
-U_left_posterior = q_mu_left  # Posterior mean as the point estimate
-q_mu_right = pyro.param("q_mu_right")
-U_right_posterior = q_mu_right  # Posterior mean as the point estimate
+    bi = 0
+    for batch_start in tqdm(range(0, N, batch_size)):
+        bi = bi + 1
+        if n_max_updates is not None and bi > n_max_updates:
+            break
 
-# Save results to files
-np.save("cluster_assignments.npy", Z_posterior.numpy())
-np.save("U_left_posterior_mean.npy", U_left_posterior.detach().numpy())
-np.save("U_right_posterior_mean.npy", U_right_posterior.detach().numpy())
+        batch_end = min(batch_start + batch_size, N)
+        batch_indices = perm[batch_start:batch_end]
 
-print("Inferred cluster assignments and U posterior mean saved to files.")
+        # Extract dense submatrix for this batch
+        dense_submatrix = compute_dense_submatrix(batch_indices)  # Shape: (batch_size, batch_size)
+
+        # Compute likelihood contributions for all nodes in the batch
+        dense_submatrix = dense_submatrix.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, batch_size, batch_size)
+        log_likelihood = (
+            dense_submatrix * log_prob_edges
+            + (1 - dense_submatrix) * log_prob_no_edges
+        )  # Shape: (K, K, batch_size, N)
+
+        # Sum over neighbors to get log probabilities for Z_i assignments
+        log_likelihood_left = log_likelihood.sum(dim=-1).sum(dim=1) # (K, batch_size)
+        log_likelihood_right = log_likelihood.sum(dim=-2).sum(dim=0) # (K, batch_size)
+        log_likelihood_node = log_likelihood_left + log_likelihood_right  # (K, batch_size)
+
+        # Update posterior probabilities for this batch
+        q_probs[batch_indices] = moving_coeff * q_probs[batch_indices] + \
+            (1 - moving_coeff) * torch.softmax(log_likelihood_node.t(), dim=-1)
+
+# M-step: Update U_left and U_right
+def m_step():
+    optimizer = torch.optim.Adam([U_left, U_right], lr=0.01)
+    perm = torch.randperm(N)
+
+    # Initialize loss tracking
+    initial_loss = 0.0
+    final_loss = 0.0
+
+    print("M-Step: Updating U_left and U_right...")
+    for batch_start in tqdm(range(0, len(perm), batch_size)):
+        batch_end = min(batch_start + batch_size, len(perm))
+        batch_indices = perm[batch_start:batch_end]
+
+        # Extract dense submatrix for this batch
+        dense_submatrix = compute_dense_submatrix(batch_indices)
+
+        # Compute likelihood for edges
+        Z_samples = torch.multinomial(q_probs[batch_indices], num_samples=1).squeeze(-1)
+        edge_probs = sigmoid(
+            (U_left[Z_samples[:, None]] @ U_right[Z_samples[None, :]].transpose(1, 2)).squeeze()
+        )
+
+        # Loss for this minibatch
+        loss = nn.BCELoss()(edge_probs, dense_submatrix)
+
+        # Update loss tracking
+        if batch_start == 0:
+            initial_loss = loss.item()  # Record the initial loss
+        final_loss = loss.item()  # Update the final loss at the end of each batch
+
+        # Update embeddings
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"M-step: Initial Loss = {initial_loss:.4f}, Final Loss = {final_loss:.4f}")
+
+# EM algorithm
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch + 1}/{num_epochs}")
+
+    # E-step: Update q_probs explicitly using dense submatrices
+    compute_q_probs(n_max_updates=5)
+    print(f"Updated q_probs for E-step (sample): {q_probs[:5]}")
+
+    # M-step: Update U_left and U_right
+    m_step()
+
+# Save results
+cluster_assignments = torch.argmax(q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
+U_left_final = U_left.detach().cpu().numpy()
+U_right_final = U_right.detach().cpu().numpy()
+
+np.save("cluster_assignments.npy", cluster_assignments)
+np.save("U_left.npy", U_left_final)
+np.save("U_right.npy", U_right_final)
+
+print("Results saved: 'cluster_assignments.npy', 'U_left.npy', 'U_right.npy'")
