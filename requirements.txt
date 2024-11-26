@@ -1,3 +1,5 @@
 pyro-ppl
 scipy
 pandas
+matplotlib
+scikit-learn
