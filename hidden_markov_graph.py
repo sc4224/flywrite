@@ -3,6 +3,7 @@ from torch import nn
 from scipy.sparse import csr_matrix, load_npz
 import numpy as np
 from tqdm import tqdm
+import gc
 
 device="cpu"
 
@@ -14,7 +15,7 @@ if torch.cuda.is_available():
 # Constants
 K = 32      # Number of clusters
 d = 32       # Dimensionality of feature space
-batch_size = 512  # Size of minibatch
+batch_size = 256  # Size of minibatch
 num_epochs = 500
 num_e_updates = 20
 num_m_updates = 60
@@ -154,9 +155,11 @@ try:
         # E-step: Update q_probs explicitly using dense submatrices
         compute_q_probs(n_max_updates=num_e_updates)
         print(f"Updated q_probs for E-step (sample): {torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
+        gc.collect()
 
         # M-step: Update U_left and U_right
         m_step(n_max_updates=num_m_updates)
+        gc.collect()
 except KeyboardInterrupt:
     print("Training interrupted.")
 
