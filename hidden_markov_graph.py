@@ -5,16 +5,16 @@ import numpy as np
 from tqdm import tqdm
 
 # Constants
-K = 32      # Number of clusters
-d = 32       # Dimensionality of feature space
+K = 16      # Number of clusters
+d = 64       # Dimensionality of feature space
 batch_size = 512  # Size of minibatch
 num_epochs = 500
-num_e_updates = 10
-num_m_updates = None
+num_e_updates = 5
+num_m_updates = 20
 
 # Load the sparse matrix from `sparse_connectivity_matrix.npz`.
 # The sparse matrix is in the format of csr_matrix.
-adj_matrix = load_npz("sparse_connectivity_matrix.npz")
+adj_matrix = load_npz("../sparse_connectivity_matrix.npz")
 
 # Threshold the sparse matrix to obtain a binary adjacency matrix
 adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
@@ -97,7 +97,7 @@ def compute_q_probs(n_max_updates=None):
 
 # M-step: Update U_left and U_right
 def m_step(n_max_updates=None):
-    optimizer = torch.optim.Adam([U_left, U_right], lr=0.01)
+    optimizer = torch.optim.Adam([U_left, U_right], lr=0.1)
     perm = torch.randperm(N)
 
     # Initialize loss tracking
@@ -146,8 +146,7 @@ try:
 
         # E-step: Update q_probs explicitly using dense submatrices
         compute_q_probs(n_max_updates=num_e_updates)
-        print(f"Updated q_probs for E-step (sample): {
-                torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
+        print(f"Updated q_probs for E-step (sample): {torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
 
         # M-step: Update U_left and U_right
         m_step(n_max_updates=num_m_updates)
@@ -156,10 +155,12 @@ except KeyboardInterrupt:
 
 # Save results
 cluster_assignments = torch.argmax(q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
+cluster_scores = torch.max(q_probs, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
 U_left_final = U_left.detach().cpu().numpy()
 U_right_final = U_right.detach().cpu().numpy()
 
 np.save("cluster_assignments.npy", cluster_assignments)
+np.save("cluster_scores.npy", cluster_scores)
 np.save("U_left.npy", U_left_final)
 np.save("U_right.npy", U_right_final)
 
