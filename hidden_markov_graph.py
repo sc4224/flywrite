@@ -4,17 +4,24 @@ from scipy.sparse import csr_matrix, load_npz
 import numpy as np
 from tqdm import tqdm
 
+device="cpu"
+
+if torch.backends.mps.is_available():
+    device="mps"
+if torch.cuda.is_available():
+    device="cuda"
+
 # Constants
-K = 16      # Number of clusters
-d = 64       # Dimensionality of feature space
+K = 32      # Number of clusters
+d = 32       # Dimensionality of feature space
 batch_size = 512  # Size of minibatch
 num_epochs = 500
-num_e_updates = 5
-num_m_updates = 20
+num_e_updates = 20
+num_m_updates = 60
 
 # Load the sparse matrix from `sparse_connectivity_matrix.npz`.
 # The sparse matrix is in the format of csr_matrix.
-adj_matrix = load_npz("../sparse_connectivity_matrix.npz")
+adj_matrix = load_npz("./sparse_connectivity_matrix.npz")
 
 # Threshold the sparse matrix to obtain a binary adjacency matrix
 adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
@@ -23,11 +30,11 @@ N = adj_matrix.shape[0]  # Number of nodes
 print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
 # Model parameters
-U_left = nn.Parameter(torch.randn(K, d))
-U_right = nn.Parameter(torch.randn(K, d))
+U_left = nn.Parameter(torch.randn(K, d).to(device))
+U_right = nn.Parameter(torch.randn(K, d).to(device))
 
 # Variational parameters for Z (initialize uniform)
-q_probs = torch.ones(N, K) / K  # Posterior probabilities of Z
+q_probs = torch.ones(N, K).to(device) / K  # Posterior probabilities of Z
 moving_coeff = 0.9  # Moving average coefficient for q_probs
 
 def sigmoid(x):
@@ -41,7 +48,7 @@ def compute_dense_submatrix(indices, rows_only=False):
         sub_adj = adj_matrix[indices, :].toarray()
     else:
         sub_adj = adj_matrix[indices, :][:, indices].toarray()
-    return torch.tensor(sub_adj, dtype=torch.float32)
+    return torch.tensor(sub_adj, dtype=torch.float32).to(device)
 
 # E-step: Update q_probs explicitly using dense submatrices
 def compute_q_probs(n_max_updates=None):
@@ -50,7 +57,7 @@ def compute_q_probs(n_max_updates=None):
     Optimized using batched matrix operations.
     """
     global q_probs
-    log_q = torch.zeros(N, K)
+    log_q = torch.zeros(N, K).to(device)
 
     # Shuffle indices to mix different vertices
     perm = torch.randperm(N)
@@ -119,7 +126,7 @@ def m_step(n_max_updates=None):
         dense_submatrix = compute_dense_submatrix(batch_indices)
 
         # Compute likelihood for edges
-        Z_samples = torch.multinomial(q_probs[batch_indices], num_samples=1).squeeze(-1)
+        Z_samples = torch.multinomial(q_probs[batch_indices], num_samples=1).squeeze(-1).to(device)
         edge_probs = sigmoid(
             (U_left[Z_samples[:, None]] @ U_right[Z_samples[None, :]].transpose(1, 2)).squeeze()
         )
