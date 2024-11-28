@@ -13,10 +13,10 @@ if torch.cuda.is_available():
     device="cuda"
 
 # Constants
-K = 32      # Number of clusters
+K = 64      # Number of clusters
 d = 32       # Dimensionality of feature space
-batch_size = 256  # Size of minibatch
-num_epochs = 500
+batch_size = 128  # Size of minibatch
+num_epochs = 2_000
 num_e_updates = 20
 num_m_updates = 60
 
