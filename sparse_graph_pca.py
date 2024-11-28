@@ -3,103 +3,114 @@ from scipy.sparse import csr_matrix, load_npz
 import numpy as np
 from tqdm import tqdm
 
-def sparse_pca(W_csr, n_components, max_iter=100, tol=1e-6, device="cuda"):
-    """Perform PCA on a sparse matrix using PyTorch without densifying."""
-    print("Starting PCA...")
 
-    # Compute column means without densifying the sparse matrix
-    col_means = torch.tensor(W_csr.mean(axis=0).A1, dtype=torch.float32, device=device)
+def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, device="cuda"):
+    """
+    Perform stochastic PCA on a sparse matrix to minimize || U U^T W - W ||^2_F.
 
-    # Convert sparse matrix to PyTorch sparse tensor
-    coo = W_csr.tocoo()
-    indices = torch.stack((torch.tensor(coo.row, dtype=torch.long),
-                           torch.tensor(coo.col, dtype=torch.long)))
-    values = torch.tensor(coo.data, dtype=torch.float32, device=device)
-    W_sparse = torch.sparse_coo_tensor(indices, values, size=W_csr.shape, device=device)
+    Args:
+        W_csr: Sparse matrix (csr_matrix).
+        n_components: Number of principal components (d).
+        batch_size: Number of rows to sample in each iteration.
+        lr: Learning rate for Adam optimizer.
+        max_iter: Maximum number of iterations.
+        tol: Tolerance for convergence.
+        device: Device to use ("cuda" or "cpu").
 
-    n_features = W_csr.shape[1]
-    components = torch.randn((n_components, n_features), device=device)
-    components = torch.nn.functional.normalize(components, dim=1)
+    Returns:
+        U: Learned principal components matrix (N x d).
+    """
+    print("Initializing stochastic PCA...")
 
-    for i in tqdm(range(max_iter)):
-        # Subtract column means on-the-fly during sparse-dense multiplication
-        scores = torch.sparse.mm(W_sparse, components.T)
-        scores -= torch.outer(torch.ones(scores.size(0), device=device), col_means @ components.T)
+    N, M = W_csr.shape  # Number of rows (N) and columns (features, M)
+    d = n_components
 
-        new_components = torch.sparse.mm(W_sparse.T, scores).T
-        new_components -= torch.outer(torch.ones(new_components.size(0), device=device), col_means @ scores.T)
-        new_components = torch.nn.functional.normalize(new_components, dim=1)
+    # Initialize U randomly
+    U = torch.randn(N, d, device=device, requires_grad=True)  # Enable gradients for U
 
-        # Check for convergence
-        diff = torch.norm(new_components - components, p='fro').item()
-        print(f"Iteration {i + 1}: diff={diff:.6f}")
-        if diff < tol:
-            print(f"Converged in {i + 1} iterations with diff={diff:.6f}")
-            break
+    # Convert W_csr to coordinate format for efficient access
+    W_coo = W_csr.tocoo()
 
-        components = new_components
+    # Initialize Adam optimizer
+    optimizer = torch.optim.Adam([U], lr=lr)
 
-    explained_variance = torch.sum(scores ** 2, dim=0)
-    return components, explained_variance, col_means
+    # Optimization loop
+    for it in tqdm(range(max_iter)):
+        # Randomly sample a batch of rows
+        batch_indices = np.random.choice(N, size=batch_size, replace=False)
 
-def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
-    """Perform k-means clustering on dense data."""
-    print("Starting K-Means...")
-    n_samples, n_features = data.shape
-    data = data.to(device)
-    indices = torch.randint(0, n_samples, (n_clusters,), device=device)
-    cluster_centers = data[indices]
+        # Extract the batch rows from W using SciPy's indexing
+        W_batch_csr = W_csr[batch_indices]  # Still sparse
+        W_batch = torch.tensor(W_batch_csr.toarray(), dtype=torch.float32, device=device)  # Dense batch
+        U_batch = U[batch_indices]  # Corresponding rows of U
 
-    for i in range(max_iter):
-        distances = torch.cdist(data, cluster_centers, p=2)
-        labels = torch.argmin(distances, dim=1)
-        new_cluster_centers = torch.stack([
-            data[labels == k].mean(dim=0) if (labels == k).sum() > 0 else cluster_centers[k]
-            for k in range(n_clusters)
-        ])
-        shift = torch.norm(new_cluster_centers - cluster_centers, p='fro').item()
-        print(f"Iteration {i + 1}: Shift={shift:.6f}")
+        # Compute reconstruction: U_batch @ (U.T @ W_batch)
+        UT_W = torch.mm(W_batch, U)  # Shape: (batch_size, d)
+        W_reconstructed = torch.mm(UT_W, U.T)  # Shape: (batch_size, features)
 
-        if shift < tol:
-            print(f"K-means converged in {i + 1} iterations with shift={shift:.6f}")
-            break
+        # Compute reconstruction error for the batch
+        diff = W_reconstructed - W_batch
+        loss = torch.norm(diff, p='fro') ** 2
 
-        cluster_centers = new_cluster_centers
+        # Zero the gradients
+        optimizer.zero_grad()
 
-    # Calculate distances to the assigned cluster centers for each example
-    distances = torch.cdist(data, cluster_centers, p=2)
-    min_distances = distances.gather(1, labels.unsqueeze(1)).squeeze()
+        # Backpropagate the loss
+        loss.backward()
 
-    return cluster_centers, labels, min_distances
+        # Perform an Adam optimization step
+        optimizer.step()
 
-# Set device priority
-device = "cpu"  # Default to CPU
-if torch.cuda.is_available():
-    device = "cuda"
+        # # Re-normalize U after the update
+        # with torch.no_grad():
+        #     U_batch_norm = torch.norm(U_batch, dim=1, keepdim=True)
+        #     U[batch_indices] = U_batch / U_batch_norm.clamp(min=1e-8)  # Prevent division by zero
 
-# Load the sparse matrix
-adj_matrix = load_npz("./sparse_connectivity_matrix.npz")
-adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
-print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+        # Check convergence (optional: compute full loss occasionally)
+        if it % 100 == 0:
+            print(f"Iteration {it}: Batch loss = {loss.item()}")
+            if loss.item() < tol:
+                print(f"Converged at iteration {it} with batch loss = {loss.item()}")
+                break
 
-# Perform PCA
-n_components = 32
-components, explained_variance, col_means = sparse_pca(adj_matrix, n_components, device=device)
-print("Components shape:", components.shape)
-print("Explained variance:", explained_variance)
+    return U
 
-# Perform k-means clustering
-n_clusters = 64  # Number of clusters
-cluster_centers, labels, min_distances = kmeans_clustering(components.T, n_clusters, device=device)
 
-print("Cluster centers shape:", cluster_centers.shape)
-print("Cluster labels shape:", labels.shape)
-print("Distances to cluster centers shape:", min_distances.shape)
+def orthogonalize(U):
+    """
+    Orthogonalize the matrix U to obtain principal components.
+    Args:
+        U: Matrix of shape (N, d) where d is the number of components.
 
-# Save the results
-torch.save(components.cpu(), 'components.pt')
-torch.save(explained_variance.cpu(), 'explained_variance.pt')
-torch.save(cluster_centers.cpu(), 'cluster_centers.pt')
-torch.save(labels.cpu(), 'labels.pt')
-torch.save(min_distances.cpu(), 'min_distances.pt')
-torch.save(col_means.cpu(), 'col_means.pt')
+    Returns:
+        U_orth: Orthogonalized U of shape (N, d).
+    """
+    print("Orthogonalizing U...")
+    Q, _ = torch.linalg.qr(U)  # QR decomposition for orthogonalization
+    return Q
+
+
+if __name__ == "__main__":
+    # Set device
+    device="cpu"
+    # if torch.backends.mps.is_available():
+    #     device="mps"
+    if torch.cuda.is_available():
+        device="cuda"
+
+    # Load the sparse matrix
+    file_path = "./sparse_connectivity_matrix.npz"
+    adj_matrix = load_npz(file_path)
+    print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+
+    # Perform stochastic PCA
+    n_components = 32
+    U = stochastic_pca(adj_matrix, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, device=device)
+
+    # Orthogonalize U to obtain principal components
+    U_orth = orthogonalize(U)
+
+    # Save the results
+    torch.save(U.cpu(), 'U.pt')
+    torch.save(U_orth.cpu(), 'U_orth.pt')
+    print("Saved U and U_orth to disk.")
