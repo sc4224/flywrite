@@ -89,6 +89,32 @@ def orthogonalize(U):
     Q, _ = torch.linalg.qr(U)  # QR decomposition for orthogonalization
     return Q
 
+def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
+    # Perform k-means clustering on the given data using PyTorch.
+    n_samples, n_features = data.shape
+    data = data.to(device)
+    indices = torch.randint(0, n_samples, (n_clusters,), device=device)
+    cluster_centers = data[indices]
+
+    for i in range(max_iter):
+        distances = torch.cdist(data, cluster_centers, p=2)
+        labels = torch.argmin(distances, dim=1)
+        new_cluster_centers = torch.stack([
+            data[labels == k].mean(dim=0) if (labels == k).sum() > 0 else cluster_centers[k]
+            for k in range(n_clusters)
+        ])
+        shift = torch.norm(new_cluster_centers - cluster_centers, p='fro').item()
+        if shift < tol:
+            print(f"K-means converged in {i + 1} iterations with shift={shift:.6f}")
+            break
+        cluster_centers = new_cluster_centers
+
+    # Calculate distances to the assigned cluster centers for each example
+    distances = torch.cdist(data, cluster_centers, p=2)
+    min_distances = distances.gather(1, labels.unsqueeze(1)).squeeze()
+
+    return cluster_centers, labels, min_distances
+
 
 if __name__ == "__main__":
     # Set device
@@ -105,12 +131,36 @@ if __name__ == "__main__":
 
     # Perform stochastic PCA
     n_components = 32
-    U = stochastic_pca(adj_matrix, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, device=device)
+    U = stochastic_pca(adj_matrix, n_components, batch_size=128, lr=0.01, max_iter=1_000, tol=1e-6, device=device)
 
     # Orthogonalize U to obtain principal components
     U_orth = orthogonalize(U)
 
+    # Perform k-means clustering
+    n_clusters = 729  # Number of clusters
+    cluster_centers, labels, min_distances = kmeans_clustering(U_orth, n_clusters, device=device)
+
+    print("Cluster centers shape:", cluster_centers.shape)
+    print("Cluster labels shape:", labels.shape)
+    print("Distances to cluster centers shape:", min_distances.shape)
+
+    # build a index-to-root_id dictionary
+    from index_mapping import load_mapping
+
+    mapping = load_mapping('./root_id_to_index_mapping.json')
+    rootid_mapping = dict((v, k) for k, v in mapping.items())
+
+    # build a cluster assignment dictionary
+    cluster_assignment_dict = dict()
+    for i in range(len(labels)):
+        root_id = mapping[i]
+        cluster_assignment_dict[root_id] = labels[i].item()
+
     # Save the results
-    torch.save(U.cpu(), 'U.pt')
     torch.save(U_orth.cpu(), 'U_orth.pt')
     print("Saved U and U_orth to disk.")
+
+    torch.save(cluster_centers.cpu(), 'cluster_centers.pt')
+    torch.save(labels.cpu(), 'labels.pt')
+    torch.save(min_distances.cpu(), 'min_distances.pt')
+    np.save("pca_cluster_assignment_dict.npy", cluster_assignment_dict, allow_pickle=True)

@@ -6,14 +6,13 @@ from tqdm import tqdm
 import gc
 
 device="cpu"
-
 if torch.backends.mps.is_available():
     device="mps"
 if torch.cuda.is_available():
     device="cuda"
 
 # Constants
-K = 64      # Number of clusters
+K = 729      # Number of clusters
 d = 32       # Dimensionality of feature space
 batch_size = 128  # Size of minibatch
 num_epochs = 2_000
@@ -169,9 +168,22 @@ cluster_scores = torch.max(q_probs, dim=-1).values.cpu().detach().numpy()  # Con
 U_left_final = U_left.detach().cpu().numpy()
 U_right_final = U_right.detach().cpu().numpy()
 
+# build a index-to-root_id dictionary
+from index_mapping import load_mapping, matrix_index_to_root_id
+
+mapping = load_mapping('./root_id_to_index_mapping.json')
+rootid_mapping = dict((v, k) for k, v in mapping.items())
+
+# build a cluster assignment dictionary
+cluster_assignment_dict = dict()
+for i in range(len(cluster_assignments)):
+    root_id = matrix_index_to_root_id(i, rootid_mapping)
+    cluster_assignment_dict[root_id] = cluster_assignments[i]
+
 np.save("cluster_assignments.npy", cluster_assignments)
 np.save("cluster_scores.npy", cluster_scores)
 np.save("U_left.npy", U_left_final)
 np.save("U_right.npy", U_right_final)
+np.save("cluster_assignment_dict.npy", cluster_assignment_dict)
 
-print("Results saved: 'cluster_assignments.npy', 'U_left.npy', 'U_right.npy'")
+print("Results saved: 'cluster_assignments.npy', 'U_left.npy', 'U_right.npy', 'cluster_assignment_dict.npy'")
