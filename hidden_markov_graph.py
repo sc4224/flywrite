@@ -18,6 +18,7 @@ batch_size = 2048  # Size of minibatch
 num_epochs = 2_000
 num_e_updates = 32
 num_m_updates = 32
+positive_factor = 1000.0
 
 dtype=torch.float32
 if device == "cuda":
@@ -37,21 +38,26 @@ print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nn
 U_left = nn.Parameter(0.0001 * torch.randn(K, d, dtype=dtype).to(device))
 U_right = nn.Parameter(0.0001 * torch.randn(K, d, dtype=dtype).to(device))
 
-# Variational parameters for Z (initialize uniform)
-log_q_probs = 0.0001 * torch.randn(N, K, dtype=dtype).to(device)
-moving_coeff = 0.  # Moving average coefficient for q_probs
+# # clip the embeddings to prevent overfitting
+# U_left.data.clamp_(-1., 1.)
+# U_right.data.clamp_(-1., 1.)
 
-def sigmoid(x, clamp=True):
+# Variational parameters for Z (initialize uniform)
+q_probs = torch.softmax(0.1 * torch.randn(N, K, dtype=dtype).to(device), dim=-1)
+
+def sigmoid(x, clamp=False):
     if clamp:
         x = torch.clamp(x, min=-5, max=5)
     return 1./(1+ torch.exp(-x))
 
-def compute_dense_submatrix(indices, rows_only=False):
+def compute_dense_submatrix(indices, rows_only=False, cols_only=False):
     """
     Given a set of indices, extract a dense submatrix from the sparse adjacency matrix.
     """
     if rows_only:
         sub_adj = adj_matrix[indices, :].toarray()
+    elif cols_only:
+        sub_adj = adj_matrix[:, indices].toarray()
     else:
         sub_adj = adj_matrix[indices, :][:, indices].toarray()
     return torch.tensor(sub_adj, dtype=dtype).to(device)
@@ -62,7 +68,7 @@ def compute_q_probs(n_max_updates=None):
     Compute q_probs using dense submatrices for tractability, with shuffled node indices.
     Optimized using batched matrix operations.
     """
-    global log_q_probs
+    global q_probs
     log_q = torch.zeros(N, K, dtype=dtype).to(device)
 
     # Shuffle indices to mix different vertices
@@ -89,10 +95,11 @@ def compute_q_probs(n_max_updates=None):
         batch_end = min(batch_start + batch_size, N)
         batch_indices = perm[batch_start:batch_end]
 
+        ### LEFT 
         # Extract dense submatrix for this batch
-        dense_submatrix = compute_dense_submatrix(batch_indices)  # Shape: (batch_size, N)
+        dense_submatrix = compute_dense_submatrix(batch_indices, rows_only=True)  # Shape: (batch_size, N)
 
-       # Compute D_i: Sum over neighbors for each node in the batch
+        # Compute D_i: Sum over neighbors for each node in the batch
         D_i = dense_submatrix.sum(dim=1)  # Shape: (batch_size,)
         D_i_comp = N - D_i  # Complement of D_i
 
@@ -100,11 +107,22 @@ def compute_q_probs(n_max_updates=None):
         s_edges_left = log_prob_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
         s_no_edges_left = log_prob_no_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
 
-        s_edges_right = log_prob_edges.sum(dim=0).squeeze(-1).squeeze(-1)  # Shape: (K,)
-        s_no_edges_right = log_prob_no_edges.sum(dim=0).squeeze(-1).squeeze(-1)  # Shape: (K,)
-
         # Compute the log likelihood contributions without creating the large tensor
         log_likelihood_left = torch.outer(s_edges_left, D_i) + torch.outer(s_no_edges_left, D_i_comp)  # Shape: (K, batch_size)
+
+        ### RIGHT
+        # Extract dense submatrix for this batch
+        dense_submatrix = compute_dense_submatrix(batch_indices, cols_only=True).t()  # Shape: (batch_size, N)
+
+        # Compute D_i: Sum over neighbors for each node in the batch
+        D_i = dense_submatrix.sum(dim=1)  # Shape: (batch_size,)
+        D_i_comp = N - D_i  # Complement of D_i
+
+        # Squeeze the probability tensors to remove unnecessary dimensions
+        s_edges_right = log_prob_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
+        s_no_edges_right = log_prob_no_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
+
+        # Compute the log likelihood contributions without creating the large tensor
         log_likelihood_right = torch.outer(s_edges_right, D_i) + torch.outer(s_no_edges_right, D_i_comp)  # Shape: (K, batch_size)
 
         # Sum the contributions to get the final log likelihood per node
@@ -114,17 +132,16 @@ def compute_q_probs(n_max_updates=None):
         log_likelihood_node = log_likelihood_node - log_likelihood_node.max(dim=0).values
 
         # Update posterior probabilities for this batch
-        log_q_probs[batch_indices] = (moving_coeff * log_q_probs[batch_indices] + \
-            (1 - moving_coeff) * torch.log(torch.softmax(log_likelihood_node.t(), dim=-1)+1e-5)).detach()
+        q_probs[batch_indices] = torch.softmax(log_likelihood_node.t(), dim=-1).detach()
 
-        if torch.isnan(log_q_probs[batch_indices]).any():
-            print("NaN detected in log_q_probs[batch_indices]. Skipping update.")
+        if torch.isnan(q_probs[batch_indices]).any():
+            print("NaN detected in q_probs[batch_indices]. Skipping update.")
             import ipdb; ipdb.set_trace()
 
-
 # M-step: Update U_left and U_right
-def m_step(n_max_updates=None):
-    optimizer = torch.optim.Adam([U_left, U_right], lr=0.001)
+def m_step(n_max_updates=None, optimizer=None):
+    if optimizer is None:
+        optimizer = torch.optim.SGD([U_left, U_right], lr=0.001)
     perm = torch.randperm(N)
 
     # Initialize loss tracking
@@ -145,10 +162,12 @@ def m_step(n_max_updates=None):
         # Extract dense submatrix for this batch
         dense_submatrix = compute_dense_submatrix(batch_indices)
 
+        # # print the ratio of positive and negative samples in `dense_submatrix`
+        # print(f"positive ratio: {torch.sum(dense_submatrix) / (dense_submatrix.shape[0] * dense_submatrix.shape[1])}")
+
         # Compute the probability distribution over Z
-        log_q_probs_batch = log_q_probs[batch_indices].detach()
-        log_q_probs_batch = log_q_probs_batch - log_q_probs_batch.max(dim=-1).values.unsqueeze(-1)
-        P_Z = torch.softmax(log_q_probs_batch, dim=-1)  # Shape: [batch_size, num_classes]
+        q_probs_batch = q_probs[batch_indices].detach()
+        P_Z = q_probs_batch  # Shape: [batch_size, num_classes]
 
         # Compute the inner products between all pairs of U_left and U_right embeddings
         scores = U_left @ U_right.T  # Shape: [num_classes, num_classes]
@@ -174,7 +193,9 @@ def m_step(n_max_updates=None):
         smoothed_labels = dense_submatrix * (1 - smoothing) + smoothing * 0.5
 
         # Loss for this minibatch with label smoothing
-        loss = nn.BCELoss()(edge_probs, smoothed_labels)
+        # we up-weight the positive samples by a factor of `positive_factor`.
+        weights = positive_factor * dense_submatrix + (1 - dense_submatrix)
+        loss = nn.BCELoss(weight=weights)(edge_probs, smoothed_labels)
 
         # Update loss tracking
         if batch_start == 0:
@@ -195,27 +216,33 @@ def m_step(n_max_updates=None):
 
         optimizer.step()
 
+        # # clip the embeddings to prevent overfitting
+        # U_left.data.clamp_(-1., 1.)
+        # U_right.data.clamp_(-1., 1.)
+
     print(f"M-step: Initial Loss = {initial_loss:.4f}, Final Loss = {final_loss:.4f}")
 
 # EM algorithm
+optimizer = torch.optim.Adam([U_left, U_right], lr=0.001)
+
 try:
     for epoch in range(num_epochs):
         print(f"Epoch {epoch + 1}/{num_epochs}")
 
         # E-step: Update q_probs explicitly using dense submatrices
         compute_q_probs(n_max_updates=num_e_updates)
-        print(f"Updated q_probs for E-step (sample): {torch.argmax(log_q_probs[:10], dim=-1).cpu().numpy()}")
+        print(f"Updated q_probs for E-step (sample): {torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
         gc.collect()
 
         # M-step: Update U_left and U_right
-        m_step(n_max_updates=num_m_updates)
+        m_step(n_max_updates=num_m_updates, optimizer=optimizer)
         gc.collect()
 except KeyboardInterrupt:
     print("Training interrupted.")
 
 # Save results
-cluster_assignments = torch.argmax(log_q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
-cluster_scores = torch.max(log_q_probs, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
+cluster_assignments = torch.argmax(q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
+cluster_scores = torch.max(q_probs, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
 U_left_final = U_left.detach().cpu().numpy()
 U_right_final = U_right.detach().cpu().numpy()
 
@@ -228,8 +255,8 @@ rootid_mapping = dict((v, k) for k, v in mapping.items())
 # build a cluster assignment dictionary
 cluster_assignment_dict = dict()
 for i in range(len(cluster_assignments)):
-    root_id = matrix_index_to_root_id(i, rootid_mapping)
-    cluster_assignment_dict[root_id] = cluster_assignments[i]
+    root_id = mapping[i]
+    cluster_assignment_dict[root_id] = cluster_assignments[i].item()
 
 np.save("cluster_assignments.npy", cluster_assignments)
 np.save("cluster_scores.npy", cluster_scores)
