@@ -13,12 +13,10 @@ if torch.cuda.is_available():
 
 # Constants
 K = 729      # Number of clusters
+logK = torch.log(torch.tensor(K))
 d = 32       # Dimensionality of feature space
-batch_size = 2048  # Size of minibatch
 num_epochs = 2_000
-num_e_updates = 32
-num_m_updates = 32
-positive_factor = 1000.0
+num_m_updates = 2
 
 dtype=torch.float32
 if device == "cuda":
@@ -34,208 +32,127 @@ adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
 N = adj_matrix.shape[0]  # Number of nodes
 print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
+# prepare the incoming and outgoing edge stats
+outgoing_sum = torch.tensor(adj_matrix.sum(axis=1)).squeeze() / N
+outgoing_sum_mean = outgoing_sum.mean()
+incoming_sum = torch.tensor(adj_matrix.sum(axis=0)).squeeze() / N
+incoming_sum_mean = incoming_sum.mean()
+
 # Model parameters
-U_left = nn.Parameter(0.0001 * torch.randn(K, d, dtype=dtype).to(device))
-U_right = nn.Parameter(0.0001 * torch.randn(K, d, dtype=dtype).to(device))
-
-# # clip the embeddings to prevent overfitting
-# U_left.data.clamp_(-1., 1.)
-# U_right.data.clamp_(-1., 1.)
-
-# Variational parameters for Z (initialize uniform)
-q_probs = torch.softmax(0.1 * torch.randn(N, K, dtype=dtype).to(device), dim=-1)
+U_left_mu = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
+U_right_mu = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
+U_left_logs = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
+U_right_logs = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
 
 def sigmoid(x, clamp=False):
     if clamp:
         x = torch.clamp(x, min=-5, max=5)
     return 1./(1+ torch.exp(-x))
 
-def compute_dense_submatrix(indices, rows_only=False, cols_only=False):
-    """
-    Given a set of indices, extract a dense submatrix from the sparse adjacency matrix.
-    """
-    if rows_only:
-        sub_adj = adj_matrix[indices, :].toarray()
-    elif cols_only:
-        sub_adj = adj_matrix[:, indices].toarray()
-    else:
-        sub_adj = adj_matrix[indices, :][:, indices].toarray()
-    return torch.tensor(sub_adj, dtype=dtype).to(device)
+def log_(x):
+    return torch.log(torch.clamp(x, min=1e-5))
+
+def dot(x, y):
+    return torch.mm(x, y.t())
+
+def cosine(x, y):
+    return torch.mm(x, y.t()) / (torch.norm(x, dim=-1) * torch.norm(y, dim=-1))
 
 # E-step: Update q_probs explicitly using dense submatrices
-def compute_q_probs(n_max_updates=None):
-    """
-    Compute q_probs using dense submatrices for tractability, with shuffled node indices.
-    Optimized using batched matrix operations.
-    """
-    global q_probs
-    log_q = torch.zeros(N, K, dtype=dtype).to(device)
+def compute_q_probs():
+    CC = sigmoid(dot(U_left_mu, U_right_mu)).detach() # (K, K)
 
-    # Shuffle indices to mix different vertices
-    perm = torch.randperm(N)
+    logc_sum = log_(CC).sum(dim=1)
+    log1c_sum = log_(1-CC).sum(dim=1)
+    outgoing = torch.outer(outgoing_sum, logc_sum) + outgoing_sum_mean * torch.outer(1 - outgoing_sum, log1c_sum)
 
-    # Compute logits for all cluster assignments (z_i, z_j)
-    logits = torch.mm(U_left, U_right.t())  # Shape: (K, K)
-    logits = logits.unsqueeze(2).unsqueeze(3)  # Shape: (K, K, 1, 1)
+    logc_sum = log_(CC).sum(dim=0)
+    log1c_sum = log_(1-CC).sum(dim=0)
+    incoming = torch.outer(incoming_sum, logc_sum) + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
 
-    # Compute probabilities for all edges and non-edges
-    prob_edges = sigmoid(logits)  # Shape: (K, K, 1, 1)
-    log_prob_edges = torch.log(prob_edges + 1e-5)  # Shape: (K, K, 1, 1)
-    log_prob_no_edges = torch.log(1 - prob_edges + 1e-5)  # Shape: (K, K, 1, 1)
+    overall = incoming + outgoing - logK
 
-    # Process in minibatches
-    print("E-Step: Computing q_probs using dense submatrices...")
+    q_probs = torch.softmax(overall, dim=-1)
 
-    bi = 0
-    for batch_start in tqdm(range(0, N, batch_size)):
-        bi = bi + 1
-        if n_max_updates is not None and bi > n_max_updates:
-            break
+    if torch.isnan(q_probs).any():
+        print("NaNs detected in q_probs!")
+        import ipdb; ipdb.set_trace()
 
-        batch_end = min(batch_start + batch_size, N)
-        batch_indices = perm[batch_start:batch_end]
-
-        ### LEFT 
-        # Extract dense submatrix for this batch
-        dense_submatrix = compute_dense_submatrix(batch_indices, rows_only=True)  # Shape: (batch_size, N)
-
-        # Compute D_i: Sum over neighbors for each node in the batch
-        D_i = dense_submatrix.sum(dim=1)  # Shape: (batch_size,)
-        D_i_comp = N - D_i  # Complement of D_i
-
-        # Squeeze the probability tensors to remove unnecessary dimensions
-        s_edges_left = log_prob_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
-        s_no_edges_left = log_prob_no_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
-
-        # Compute the log likelihood contributions without creating the large tensor
-        log_likelihood_left = torch.outer(s_edges_left, D_i) + torch.outer(s_no_edges_left, D_i_comp)  # Shape: (K, batch_size)
-
-        ### RIGHT
-        # Extract dense submatrix for this batch
-        dense_submatrix = compute_dense_submatrix(batch_indices, cols_only=True).t()  # Shape: (batch_size, N)
-
-        # Compute D_i: Sum over neighbors for each node in the batch
-        D_i = dense_submatrix.sum(dim=1)  # Shape: (batch_size,)
-        D_i_comp = N - D_i  # Complement of D_i
-
-        # Squeeze the probability tensors to remove unnecessary dimensions
-        s_edges_right = log_prob_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
-        s_no_edges_right = log_prob_no_edges.sum(dim=1).squeeze(-1).squeeze(-1)  # Shape: (K,)
-
-        # Compute the log likelihood contributions without creating the large tensor
-        log_likelihood_right = torch.outer(s_edges_right, D_i) + torch.outer(s_no_edges_right, D_i_comp)  # Shape: (K, batch_size)
-
-        # Sum the contributions to get the final log likelihood per node
-        log_likelihood_node = (log_likelihood_left + log_likelihood_right) / batch_size  # Shape: (K, batch_size)
-
-        # Subtract the maximum value for numerical stability
-        log_likelihood_node = log_likelihood_node - log_likelihood_node.max(dim=0).values
-
-        # Update posterior probabilities for this batch
-        q_probs[batch_indices] = torch.softmax(log_likelihood_node.t(), dim=-1).detach()
-
-        if torch.isnan(q_probs[batch_indices]).any():
-            print("NaN detected in q_probs[batch_indices]. Skipping update.")
-            import ipdb; ipdb.set_trace()
+    return q_probs.detach()
 
 # M-step: Update U_left and U_right
-def m_step(n_max_updates=None, optimizer=None):
+def m_step(q_probs, n_max_updates=None, optimizer=None):
+    if n_max_updates is None:
+        n_max_updates = 1
     if optimizer is None:
-        optimizer = torch.optim.SGD([U_left, U_right], lr=0.001)
-    perm = torch.randperm(N)
+        optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs], lr=0.001)
 
-    # Initialize loss tracking
-    initial_loss = 0.0
-    final_loss = 0.0
+    initial_loss = 0.
+    final_loss = 0.
 
-    print("M-Step: Updating U_left and U_right...")
-    bi = 0
-    for batch_start in tqdm(range(0, len(perm), batch_size)):
-        bi = bi + 1
-
-        if n_max_updates is not None and bi > n_max_updates:
-            break
-
-        batch_end = min(batch_start + batch_size, len(perm))
-        batch_indices = perm[batch_start:batch_end]
-
-        # Extract dense submatrix for this batch
-        dense_submatrix = compute_dense_submatrix(batch_indices)
-
-        # # print the ratio of positive and negative samples in `dense_submatrix`
-        # print(f"positive ratio: {torch.sum(dense_submatrix) / (dense_submatrix.shape[0] * dense_submatrix.shape[1])}")
-
-        # Compute the probability distribution over Z
-        q_probs_batch = q_probs[batch_indices].detach()
-        P_Z = q_probs_batch  # Shape: [batch_size, num_classes]
-
-        # Compute the inner products between all pairs of U_left and U_right embeddings
-        scores = U_left @ U_right.T  # Shape: [num_classes, num_classes]
-
-        # Compute the sigmoid of the clamped scores
-        sigmoid_scores = sigmoid(scores)  # Shape: [num_classes, num_classes]
-
-        if torch.isnan(scores).any():
-            print("NaN detected in scores. Skipping update.")
-            import ipdb; ipdb.set_trace()
-
-        # Compute the expected edge probabilities over Z
-        edge_probs = P_Z @ sigmoid_scores @ P_Z.T  # Shape: [batch_size, batch_size]
-
-        if torch.isnan(edge_probs).any():
-            print("NaN detected in edge_probs. Skipping update.")
-            import ipdb; ipdb.set_trace()
-
-        # Define the label smoothing parameter
-        smoothing = 0.1  # Adjust this value as needed (typically small, e.g., 0.1)
-
-        # Apply label smoothing to the target labels
-        smoothed_labels = dense_submatrix * (1 - smoothing) + smoothing * 0.5
-
-        # Loss for this minibatch with label smoothing
-        # we up-weight the positive samples by a factor of `positive_factor`.
-        weights = positive_factor * dense_submatrix + (1 - dense_submatrix)
-        loss = nn.BCELoss(weight=weights)(edge_probs, smoothed_labels)
-
-        # Update loss tracking
-        if batch_start == 0:
-            initial_loss = loss.item()  # Record the initial loss
-        final_loss = loss.item()  # Update the final loss at the end of each batch
-
-        # Update embeddings
+    for i in tqdm(range(n_max_updates)):
         optimizer.zero_grad()
+
+        # Compute the gradient of the ELBO w.r.t. U_left and U_right
+        U_left = U_left_mu + torch.exp(U_left_logs) * torch.randn_like(U_left_mu)
+        U_right = U_right_mu + torch.exp(U_right_logs) * torch.randn_like(U_right_mu)
+        CC = sigmoid(dot(U_left, U_right))
+
+        logc_sum = log_(CC).sum(dim=1)
+        log1c_sum = log_(1-CC).sum(dim=1)
+        outgoing = torch.outer(outgoing_sum, logc_sum) + outgoing_sum_mean * torch.outer(1 - outgoing_sum, log1c_sum)
+
+        logc_sum = log_(CC).sum(dim=0)
+        log1c_sum = log_(1-CC).sum(dim=0)
+        incoming = torch.outer(incoming_sum, logc_sum) + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
+
+        overall = incoming + outgoing + log_(q_probs.detach())
+
+        loss = -torch.logsumexp(overall, dim=-1).mean()
+
+        # KL divergence between Normal(U_left_mu, U_left_logs) and Normal(0, 1)
+        kl_left = 0.5 * (U_left_mu.pow(2) + U_left_logs.exp() - 1 - U_left_logs).sum()
+        # KL divergence between Normal(U_right_mu, U_right_logs) and Normal(0, 1)
+        kl_right = 0.5 * (U_right_mu.pow(2) + U_right_logs.exp() - 1 - U_right_logs).sum()
+
+        loss += kl_left + kl_right
         loss.backward()
 
-        if torch.isnan(U_left.grad).any() or torch.isnan(U_right.grad).any():
-            print("NaN detected in gradients. Skipping update.")
-            import ipdb; ipdb.set_trace()
+        if i == 0:
+            initial_loss = loss.item()
+        final_loss = loss.item()
 
-        # Clip gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(U_left, 1.0)
-        torch.nn.utils.clip_grad_norm_(U_right, 1.0)
+        # Clip the gradients to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(U_left_mu, 1.0)
+        torch.nn.utils.clip_grad_norm_(U_right_mu, 1.0)
+        torch.nn.utils.clip_grad_norm_(U_left_logs, 1.0)
+        torch.nn.utils.clip_grad_norm_(U_right_logs, 1.0)
 
+        # Perform a gradient step
         optimizer.step()
 
-        # # clip the embeddings to prevent overfitting
-        # U_left.data.clamp_(-1., 1.)
-        # U_right.data.clamp_(-1., 1.)
+    print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
 
-    print(f"M-step: Initial Loss = {initial_loss:.4f}, Final Loss = {final_loss:.4f}")
 
 # EM algorithm
-optimizer = torch.optim.Adam([U_left, U_right], lr=0.001)
+optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs], lr=0.001)
 
 try:
     for epoch in range(num_epochs):
         print(f"Epoch {epoch + 1}/{num_epochs}")
 
         # E-step: Update q_probs explicitly using dense submatrices
-        compute_q_probs(n_max_updates=num_e_updates)
-        print(f"Updated q_probs for E-step (sample): {torch.argmax(q_probs[:10], dim=-1).cpu().numpy()}")
+        q_probs = compute_q_probs()
+        # now print the cluster assignments of the first 10 items.
+        # make sure to print their log-probabilities (up to 3 digits) as well.
+        print("Cluster assignments:")
+        for i in range(10):
+            print(f"Node {i}: Cluster {torch.argmax(q_probs[i]).item()} (Prob: {q_probs[i].max().item():.3f})")
+
         gc.collect()
 
         # M-step: Update U_left and U_right
-        m_step(n_max_updates=num_m_updates, optimizer=optimizer)
+        m_step(q_probs, n_max_updates=num_m_updates, optimizer=optimizer)
         gc.collect()
 except KeyboardInterrupt:
     print("Training interrupted.")
@@ -243,8 +160,8 @@ except KeyboardInterrupt:
 # Save results
 cluster_assignments = torch.argmax(q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
 cluster_scores = torch.max(q_probs, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
-U_left_final = U_left.detach().cpu().numpy()
-U_right_final = U_right.detach().cpu().numpy()
+U_left_final = U_left_mu.detach().cpu().numpy()
+U_right_final = U_right_mu.detach().cpu().numpy()
 
 # build a index-to-root_id dictionary
 from index_mapping import load_mapping, matrix_index_to_root_id
