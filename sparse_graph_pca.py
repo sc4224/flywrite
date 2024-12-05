@@ -27,6 +27,8 @@ def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, 
 
     # Initialize U randomly
     U = torch.randn(N, d, device=device, requires_grad=True)  # Enable gradients for U
+    # Initialize b randomly
+    b = torch.tensor([W_csr.mean()]).to(device)
 
     # Convert W_csr to coordinate format for efficient access
     W_coo = W_csr.tocoo()
@@ -34,46 +36,49 @@ def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, 
     # Initialize Adam optimizer
     optimizer = torch.optim.Adam([U], lr=lr)
 
-    # Optimization loop
-    for it in tqdm(range(max_iter)):
-        # Randomly sample a batch of rows
-        batch_indices = np.random.choice(N, size=batch_size, replace=False)
+    try:
+        # Optimization loop
+        for it in tqdm(range(max_iter)):
+            # Randomly sample a batch of rows
+            batch_indices = np.random.choice(N, size=batch_size, replace=False)
 
-        # Extract the batch rows from W using SciPy's indexing
-        W_batch_csr = W_csr[batch_indices]  # Still sparse
-        W_batch = torch.tensor(W_batch_csr.toarray(), dtype=torch.float32, device=device)  # Dense batch
-        U_batch = U[batch_indices]  # Corresponding rows of U
+            # Extract the batch rows from W using SciPy's indexing
+            W_batch_csr = W_csr[batch_indices]  # Still sparse
+            W_batch = torch.tensor(W_batch_csr.toarray(), dtype=torch.float32, device=device)  # Dense batch
+            U_batch = U[batch_indices]  # Corresponding rows of U
 
-        # Compute reconstruction: U_batch @ (U.T @ W_batch)
-        UT_W = torch.mm(W_batch, U)  # Shape: (batch_size, d)
-        W_reconstructed = torch.mm(UT_W, U.T)  # Shape: (batch_size, features)
+            # Compute reconstruction: U_batch @ (U.T @ W_batch)
+            UT_W = torch.mm(W_batch, U)  # Shape: (batch_size, d)
+            W_reconstructed = torch.mm(UT_W, U.T)  # Shape: (batch_size, features)
 
-        # Compute reconstruction error for the batch
-        diff = W_reconstructed - W_batch
-        loss = torch.norm(diff, p='fro') ** 2
+            # Compute reconstruction error for the batch
+            diff = W_reconstructed - W_batch + b
+            loss = torch.norm(diff, p='fro') ** 2
 
-        # Zero the gradients
-        optimizer.zero_grad()
+            # Zero the gradients
+            optimizer.zero_grad()
 
-        # Backpropagate the loss
-        loss.backward()
+            # Backpropagate the loss
+            loss.backward()
 
-        # Perform an Adam optimization step
-        optimizer.step()
+            # Perform an Adam optimization step
+            optimizer.step()
 
-        # # Re-normalize U after the update
-        # with torch.no_grad():
-        #     U_batch_norm = torch.norm(U_batch, dim=1, keepdim=True)
-        #     U[batch_indices] = U_batch / U_batch_norm.clamp(min=1e-8)  # Prevent division by zero
+            # # Re-normalize U after the update
+            # with torch.no_grad():
+            #     U_batch_norm = torch.norm(U_batch, dim=1, keepdim=True)
+            #     U[batch_indices] = U_batch / U_batch_norm.clamp(min=1e-8)  # Prevent division by zero
 
-        # Check convergence (optional: compute full loss occasionally)
-        if it % 100 == 0:
-            print(f"Iteration {it}: Batch loss = {loss.item()}")
-            if loss.item() < tol:
-                print(f"Converged at iteration {it} with batch loss = {loss.item()}")
-                break
+            # Check convergence (optional: compute full loss occasionally)
+            if it % 100 == 0:
+                print(f"Iteration {it}: Batch loss = {loss.item()}")
+                if loss.item() < tol:
+                    print(f"Converged at iteration {it} with batch loss = {loss.item()}")
+                    break
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
 
-    return U
+    return U, b
 
 
 def orthogonalize(U):
@@ -131,8 +136,8 @@ if __name__ == "__main__":
 
     # Perform stochastic PCA
     n_components = 32
-    U = stochastic_pca(adj_matrix, n_components, batch_size=128, lr=0.01, max_iter=1_000, tol=1e-6, device=device)
-
+    U, b = stochastic_pca(adj_matrix, n_components, batch_size=128, lr=0.01, max_iter=10_000, tol=1e-6, device=device)
+    
     # Orthogonalize U to obtain principal components
     U_orth = orthogonalize(U)
 
@@ -160,7 +165,7 @@ if __name__ == "__main__":
     torch.save(U_orth.cpu(), 'U_orth.pt')
     print("Saved U and U_orth to disk.")
 
-    torch.save(cluster_centers.cpu(), 'cluster_centers.pt')
-    torch.save(labels.cpu(), 'labels.pt')
-    torch.save(min_distances.cpu(), 'min_distances.pt')
+    torch.save(cluster_centers.cpu(), 'pca_cluster_centers.pt')
+    torch.save(labels.cpu(), 'pca_labels.pt')
+    torch.save(min_distances.cpu(), 'pca_min_distances.pt')
     np.save("pca_cluster_assignment_dict.npy", cluster_assignment_dict, allow_pickle=True)

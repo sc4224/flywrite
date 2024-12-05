@@ -12,11 +12,11 @@ if torch.cuda.is_available():
     device="cuda"
 
 # Constants
-K = 729      # Number of clusters
+K = 64      # Number of clusters: 729
 logK = torch.log(torch.tensor(K))
-d = 64       # Dimensionality of feature space
+d = 32       # Dimensionality of feature space
 num_epochs = 2_000
-num_m_updates = 10
+num_m_updates = 50
 
 dtype=torch.float32
 if device == "cuda":
@@ -39,10 +39,12 @@ incoming_sum = torch.tensor(adj_matrix.sum(axis=0)).squeeze() / N
 incoming_sum_mean = incoming_sum.mean()
 
 # Model parameters
-U_left_mu = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
-U_right_mu = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
-U_left_logs = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
-U_right_logs = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
+U_left_mu = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
+U_right_mu = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
+U_left_logs = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
+U_right_logs = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
+bias_mu = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()])).to(device))
+bias_logs = nn.Parameter(1e-4 * torch.randn(1, dtype=dtype).to(device))
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -60,15 +62,20 @@ def cosine(x, y):
 
 # E-step: Update q_probs explicitly using dense submatrices
 def compute_q_probs(q_probs_old=None):
-    CC = sigmoid(dot(U_left_mu, U_right_mu)).detach() # (K, K)
+    U_left = U_left_mu + torch.exp(U_left_logs) * torch.randn_like(U_left_mu)
+    U_right = U_right_mu + torch.exp(U_right_logs) * torch.randn_like(U_right_mu)
+    bias = bias_mu + torch.exp(bias_logs) * torch.randn_like(bias_mu)
+    CC = sigmoid(dot(U_left, U_right) + bias)
 
     logc_sum = log_(CC).sum(dim=1)
     log1c_sum = log_(1-CC).sum(dim=1)
-    outgoing = torch.outer(outgoing_sum, logc_sum) + outgoing_sum_mean * torch.outer(1 - outgoing_sum, log1c_sum)
+    outgoing = torch.outer(outgoing_sum, logc_sum) 
+    outgoing = outgoing + torch.outer(1 - outgoing_sum, log1c_sum)
 
     logc_sum = log_(CC).sum(dim=0)
     log1c_sum = log_(1-CC).sum(dim=0)
-    incoming = torch.outer(incoming_sum, logc_sum) + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
+    incoming = torch.outer(incoming_sum, logc_sum) 
+    incoming = incoming + torch.outer(1 - incoming_sum, log1c_sum)
 
     overall = incoming + outgoing
 
@@ -88,7 +95,7 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
     if n_max_updates is None:
         n_max_updates = 1
     if optimizer is None:
-        optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs], lr=0.001)
+        optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs, bias_mu, bias_logs], lr=0.001)
 
     initial_loss = 0.
     final_loss = 0.
@@ -99,19 +106,24 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
         # Compute the gradient of the ELBO w.r.t. U_left and U_right
         U_left = U_left_mu + torch.exp(U_left_logs) * torch.randn_like(U_left_mu)
         U_right = U_right_mu + torch.exp(U_right_logs) * torch.randn_like(U_right_mu)
-        CC = sigmoid(dot(U_left, U_right))
+        bias = bias_mu + torch.exp(bias_logs) * torch.randn_like(bias_mu)
+        CC = sigmoid(dot(U_left, U_right) + bias)
 
         logc_sum = log_(CC).sum(dim=1)
         log1c_sum = log_(1-CC).sum(dim=1)
-        outgoing = torch.outer(outgoing_sum, logc_sum) + outgoing_sum_mean * torch.outer(1 - outgoing_sum, log1c_sum)
+        outgoing = torch.outer(outgoing_sum, logc_sum)
+        outgoing = outgoing + torch.outer(1 - outgoing_sum, log1c_sum)
 
         logc_sum = log_(CC).sum(dim=0)
         log1c_sum = log_(1-CC).sum(dim=0)
-        incoming = torch.outer(incoming_sum, logc_sum) + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
+        incoming = torch.outer(incoming_sum, logc_sum) 
+        incoming = incoming + torch.outer(1 - incoming_sum, log1c_sum)
 
-        overall = incoming + outgoing + log_(q_probs.detach())
-
-        loss = -torch.logsumexp(overall, dim=-1).mean()
+        overall = incoming + outgoing
+        
+        # weighted sum of `overall` using q_probs
+        overall = (q_probs * overall).sum(dim=-1)
+        loss = -overall.sum()
 
         # KL divergence between Normal(U_left_mu, U_left_logs) and Normal(0, 1)
         kl_left = 0.5 * (U_left_mu.pow(2) + U_left_logs.exp() - 1 - U_left_logs).sum()
@@ -126,10 +138,9 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
         final_loss = loss.item()
 
         # Clip the gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(U_left_mu, 1.0)
-        torch.nn.utils.clip_grad_norm_(U_right_mu, 1.0)
-        torch.nn.utils.clip_grad_norm_(U_left_logs, 1.0)
-        torch.nn.utils.clip_grad_norm_(U_right_logs, 1.0)
+        torch.nn.utils.clip_grad_norm_([U_left_mu, U_right_mu, 
+                                        U_left_logs, U_right_logs, 
+                                        bias_mu, bias_logs], 1.0)
 
         # Perform a gradient step
         optimizer.step()
@@ -140,7 +151,9 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
 
 
 # EM algorithm
-optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs], lr=0.001)
+optimizer = torch.optim.AdamW([U_left_mu, U_right_mu, 
+                               U_left_logs, U_right_logs, 
+                               bias_mu, bias_logs], lr=0.001)
 
 q_probs = None
 
@@ -149,18 +162,15 @@ try:
         print(f"Epoch {epoch + 1}/{num_epochs}")
 
         # E-step: Update q_probs explicitly using dense submatrices
-        q_probs = compute_q_probs(q_probs_old=q_probs)
+        q_probs = compute_q_probs(q_probs_old=None)
         # now print the cluster assignments of the first 10 items.
         # make sure to print their log-probabilities (up to 3 digits) as well.
         print("Cluster assignments:")
         for i in range(10):
             print(f"Node {i}: Cluster {torch.argmax(q_probs[i]).item()} (Prob: {q_probs[i].max().item():.3f})")
 
-        gc.collect()
-
         # M-step: Update U_left and U_right
         m_step(q_probs, n_max_updates=num_m_updates, optimizer=optimizer)
-        gc.collect()
 except KeyboardInterrupt:
     print("Training interrupted.")
 

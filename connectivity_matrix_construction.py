@@ -44,7 +44,7 @@ def reconstruct_sparse_square_matrix(input_file, matrix_output_file, mapping_out
 
 if __name__ == "__main__":
     # Input gzipped CSV file, output files for matrix and mapping
-    input_csv_file = "connections_no_threshold.csv.gz"
+    input_csv_file = "connections.csv.gz"
     matrix_output_file = "sparse_connectivity_matrix.npz"
     mapping_output_file = "root_id_to_index_mapping.json"
     
