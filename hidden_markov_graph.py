@@ -14,9 +14,9 @@ if torch.cuda.is_available():
 # Constants
 K = 729      # Number of clusters
 logK = torch.log(torch.tensor(K))
-d = 32       # Dimensionality of feature space
+d = 64       # Dimensionality of feature space
 num_epochs = 2_000
-num_m_updates = 2
+num_m_updates = 10
 
 dtype=torch.float32
 if device == "cuda":
@@ -39,10 +39,10 @@ incoming_sum = torch.tensor(adj_matrix.sum(axis=0)).squeeze() / N
 incoming_sum_mean = incoming_sum.mean()
 
 # Model parameters
-U_left_mu = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
-U_right_mu = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
-U_left_logs = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
-U_right_logs = nn.Parameter(1e-3 * torch.randn(K, d, dtype=dtype).to(device))
+U_left_mu = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
+U_right_mu = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
+U_left_logs = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
+U_right_logs = nn.Parameter(1e-2 * torch.randn(K, d, dtype=dtype).to(device))
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -50,7 +50,7 @@ def sigmoid(x, clamp=False):
     return 1./(1+ torch.exp(-x))
 
 def log_(x):
-    return torch.log(torch.clamp(x, min=1e-5))
+    return torch.log(torch.clamp(x, min=1e-6))
 
 def dot(x, y):
     return torch.mm(x, y.t())
@@ -59,7 +59,7 @@ def cosine(x, y):
     return torch.mm(x, y.t()) / (torch.norm(x, dim=-1) * torch.norm(y, dim=-1))
 
 # E-step: Update q_probs explicitly using dense submatrices
-def compute_q_probs():
+def compute_q_probs(q_probs_old=None):
     CC = sigmoid(dot(U_left_mu, U_right_mu)).detach() # (K, K)
 
     logc_sum = log_(CC).sum(dim=1)
@@ -70,9 +70,12 @@ def compute_q_probs():
     log1c_sum = log_(1-CC).sum(dim=0)
     incoming = torch.outer(incoming_sum, logc_sum) + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
 
-    overall = incoming + outgoing - logK
+    overall = incoming + outgoing
 
-    q_probs = torch.softmax(overall, dim=-1)
+    if q_probs_old is None:
+        q_probs = torch.softmax(overall, dim=-1)
+    else:
+        q_probs = 0.9 * q_probs_old + 0.1 * torch.softmax(overall, dim=-1)
 
     if torch.isnan(q_probs).any():
         print("NaNs detected in q_probs!")
@@ -115,7 +118,7 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
         # KL divergence between Normal(U_right_mu, U_right_logs) and Normal(0, 1)
         kl_right = 0.5 * (U_right_mu.pow(2) + U_right_logs.exp() - 1 - U_right_logs).sum()
 
-        loss += kl_left + kl_right
+        loss += 1. * (kl_left + kl_right)
         loss.backward()
 
         if i == 0:
@@ -131,18 +134,22 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
         # Perform a gradient step
         optimizer.step()
 
+    # import ipdb; ipdb.set_trace()
+
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
 
 
 # EM algorithm
 optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs], lr=0.001)
 
+q_probs = None
+
 try:
     for epoch in range(num_epochs):
         print(f"Epoch {epoch + 1}/{num_epochs}")
 
         # E-step: Update q_probs explicitly using dense submatrices
-        q_probs = compute_q_probs()
+        q_probs = compute_q_probs(q_probs_old=q_probs)
         # now print the cluster assignments of the first 10 items.
         # make sure to print their log-probabilities (up to 3 digits) as well.
         print("Cluster assignments:")
