@@ -12,9 +12,9 @@ if torch.cuda.is_available():
     device="cuda"
 
 # Constants
-K = 128      # Number of clusters: 729
+K = 729      # Number of clusters: 729
 d = 32       # Dimensionality of feature space
-num_m_updates = 10_000
+num_m_updates = 1_000
 
 dtype=torch.float32
 if device == "cuda":
@@ -41,10 +41,10 @@ incoming_sum_mean = incoming_sum.mean()
 # Model parameters
 U_left = nn.Parameter(1e-1 * torch.randn(K, d, dtype=dtype).to(device))
 U_right = nn.Parameter(1e-1 * torch.randn(K, d, dtype=dtype).to(device))
-bias = nn.Parameter(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device))
+bias = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device)))
 
 # approximate posterior: must be sampled from a Dirichlet distribution
-q_logits = nn.Parameter(1e-1 * torch.randn(N, K, dtype=dtype).to(device))
+q_logits = nn.Parameter(1/np.sqrt(K) * torch.randn(N, K, dtype=dtype).to(device))
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -65,7 +65,7 @@ def m_step(n_max_updates=None, optimizer=None):
     if n_max_updates is None:
         n_max_updates = 1
     if optimizer is None:
-        optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=0.001)
+        optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=0.001)
 
     initial_loss = 0.
     final_loss = 0.
