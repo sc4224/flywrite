@@ -72,11 +72,6 @@ def m_step(n_max_updates=None, optimizer=None):
     initial_loss = 0.
     final_loss = 0.
 
-    # if minibatch_size is not even, make it even
-    global minibatch_size
-    if minibatch_size % 2 != 0:
-        minibatch_size += 1
-
     # create a random permutation of the indices
     indices = torch.randperm(N, device=device)
     n_minibatches = N // minibatch_size
@@ -89,22 +84,14 @@ def m_step(n_max_updates=None, optimizer=None):
 
         # Get the minibatch indices
         minibatch_indices = indices[i * minibatch_size: (i + 1) * minibatch_size]
-        # divide the minibatch into two equal-sized portion
-        minibatch_indices_left = minibatch_indices[:minibatch_size//2]
-        minibatch_indices_right = minibatch_indices[minibatch_size//2:]
 
         # Get the minibatch of q_logits
-        q_logits_batch_left = q_logits[minibatch_indices_left]
-        q_logits_batch_right = q_logits[minibatch_indices_right]
+        q_logits_batch = q_logits[minibatch_indices]
 
         # get the minibatch of adjacency matrix
-        adj_matrix_batch = torch.tensor(adj_matrix[minibatch_indices_left,:]
-                                        [:,minibatch_indices_right].toarray(), 
-                                        dtype=dtype).to(device)
+        outgoing_sum_batch = outgoing_sum[minibatch_indices]
+        incoming_sum_batch = incoming_sum[minibatch_indices]
         
-        outgoing_sum = adj_matrix_batch.sum(dim=1) / (minibatch_size//2)
-        incoming_sum = adj_matrix_batch.sum(dim=0) / (minibatch_size//2)
-
         optimizer.zero_grad()
 
         # Compute the gradient of the ELBO w.r.t. U_left and U_right
@@ -112,18 +99,25 @@ def m_step(n_max_updates=None, optimizer=None):
 
         logc_sum = log_(CC).sum(dim=1)
         log1c_sum = log_(1-CC).sum(dim=1)
-        outgoing = torch.outer(outgoing_sum, logc_sum)
-        outgoing = outgoing + torch.outer(1 - outgoing_sum, log1c_sum)
+        outgoing = torch.outer(outgoing_sum_batch, logc_sum)
+        outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum_batch, log1c_sum)
 
         logc_sum = log_(CC).sum(dim=0)
         log1c_sum = log_(1-CC).sum(dim=0)
-        incoming = torch.outer(incoming_sum, logc_sum) 
-        incoming = incoming + torch.outer(1 - incoming_sum, log1c_sum)
+        incoming = torch.outer(incoming_sum_batch, logc_sum) 
+        incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum_batch, log1c_sum)
 
-        overall = (torch.softmax(q_logits_batch_left, dim=-1) * outgoing).sum(dim=-1)
-        overall = overall + (torch.softmax(q_logits_batch_right, dim=-1) * incoming).sum(dim=-1)
-
+        overall = outgoing + incoming
+        
+        # weighted sum of `overall` using q_probs
+        overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
         loss = -overall.sum()
+
+        # # compute the prior term on q_logits
+        # q_probs = torch.softmax(q_logits_batch, dim=-1)
+        # prior = q_probs * (log_(q_probs) - logK)
+        # prior = prior.sum()
+        # loss = loss + prior
 
         loss.backward()
 
