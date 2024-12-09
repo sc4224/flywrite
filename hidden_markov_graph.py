@@ -14,7 +14,9 @@ if torch.cuda.is_available():
 # Constants
 K = 729      # Number of clusters: 729
 d = 32       # Dimensionality of feature space
-num_m_updates = 1_000
+minibatch_size = 1024
+num_m_updates = 10_000
+n_epochs = 1_000
 
 dtype=torch.float32
 if device == "cuda":
@@ -70,7 +72,29 @@ def m_step(n_max_updates=None, optimizer=None):
     initial_loss = 0.
     final_loss = 0.
 
-    for i in tqdm(range(n_max_updates)):
+    # create a random permutation of the indices
+    indices = torch.randperm(N, device=device)
+    n_minibatches = N // minibatch_size
+
+    for i in tqdm(range(n_minibatches)):
+
+        if i > n_max_updates:
+            print(f"Reached maximum number of updates {n_max_updates}.")
+            break
+
+        # Get the minibatch indices
+        minibatch_indices = indices[i * minibatch_size: (i + 1) * minibatch_size]
+
+        # Get the minibatch of q_logits
+        q_logits_batch = q_logits[minibatch_indices]
+
+        # get the minibatch of adjacency matrix
+        adj_matrix_batch = torch.tensor(adj_matrix[minibatch_indices,:][:,minibatch_indices].toarray(), 
+                                        dtype=dtype).to(device)
+        
+        outgoing_sum = adj_matrix_batch.sum(dim=1) / minibatch_size
+        incoming_sum = adj_matrix_batch.sum(dim=0) / minibatch_size
+
         optimizer.zero_grad()
 
         # Compute the gradient of the ELBO w.r.t. U_left and U_right
@@ -89,7 +113,7 @@ def m_step(n_max_updates=None, optimizer=None):
         overall = incoming + outgoing
         
         # weighted sum of `overall` using q_probs
-        overall = (torch.softmax(q_logits, dim=-1) * overall).sum(dim=-1)
+        overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
         loss = -overall.sum()
 
         loss.backward()
@@ -98,18 +122,11 @@ def m_step(n_max_updates=None, optimizer=None):
             initial_loss = loss.item()
         final_loss = loss.item()
 
-        # Clip the gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_([U_left, U_right, bias, q_logits], 1.0)
+        # # Clip the gradients to prevent exploding gradients
+        # torch.nn.utils.clip_grad_norm_([U_left, U_right, bias, q_logits], 1.0)
 
         # Perform a gradient step
         optimizer.step()
-
-        if i % 10 == 0:
-            print(f"Loss at iteration {i}: {loss.item()}")
-            print("Cluster assignments:")
-            for i in range(10):
-                print(f"Node {i}: Cluster {torch.argmax(q_logits[i]).item()}")
-
     # import ipdb; ipdb.set_trace()
 
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
@@ -119,8 +136,14 @@ def m_step(n_max_updates=None, optimizer=None):
 optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=0.001)
 
 try:
-    # M-step: Update U_left and U_right
-    m_step(n_max_updates=num_m_updates, optimizer=optimizer)
+    for epoch in range(n_epochs):
+        print(f"Epoch {epoch}")
+        # M-step: Update U_left and U_right
+        m_step(n_max_updates=num_m_updates, optimizer=optimizer)
+        print("Cluster assignments:")
+        for i in range(10):
+            print(f"Node {i}: Cluster {torch.argmax(q_logits[i]).item()}")
+
 except KeyboardInterrupt:
     print("Training interrupted.")
 
@@ -129,8 +152,6 @@ cluster_assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()  # Inferred c
 cluster_scores = torch.max(q_logits, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
 U_left_final = U_left.detach().cpu().numpy()
 U_right_final = U_right.detach().cpu().numpy()
-# U_left_final = U_left_mu.detach().cpu().numpy()
-# U_right_final = U_right_mu.detach().cpu().numpy()
 
 # build a index-to-root_id dictionary
 from index_mapping import load_mapping, matrix_index_to_root_id
