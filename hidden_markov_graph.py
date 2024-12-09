@@ -14,7 +14,7 @@ if torch.cuda.is_available():
 # Constants
 K = 729      # Number of clusters: 729
 d = 32       # Dimensionality of feature space
-minibatch_size = 1024
+minibatch_size = 5_000
 num_m_updates = 10_000
 n_epochs = 1_000
 
@@ -72,6 +72,11 @@ def m_step(n_max_updates=None, optimizer=None):
     initial_loss = 0.
     final_loss = 0.
 
+    # if minibatch_size is not even, make it even
+    global minibatch_size
+    if minibatch_size % 2 != 0:
+        minibatch_size += 1
+
     # create a random permutation of the indices
     indices = torch.randperm(N, device=device)
     n_minibatches = N // minibatch_size
@@ -84,16 +89,21 @@ def m_step(n_max_updates=None, optimizer=None):
 
         # Get the minibatch indices
         minibatch_indices = indices[i * minibatch_size: (i + 1) * minibatch_size]
+        # divide the minibatch into two equal-sized portion
+        minibatch_indices_left = minibatch_indices[:minibatch_size//2]
+        minibatch_indices_right = minibatch_indices[minibatch_size//2:]
 
         # Get the minibatch of q_logits
-        q_logits_batch = q_logits[minibatch_indices]
+        q_logits_batch_left = q_logits[minibatch_indices_left]
+        q_logits_batch_right = q_logits[minibatch_indices_right]
 
         # get the minibatch of adjacency matrix
-        adj_matrix_batch = torch.tensor(adj_matrix[minibatch_indices,:][:,minibatch_indices].toarray(), 
+        adj_matrix_batch = torch.tensor(adj_matrix[minibatch_indices_left,:]
+                                        [:,minibatch_indices_right].toarray(), 
                                         dtype=dtype).to(device)
         
-        outgoing_sum = adj_matrix_batch.sum(dim=1) / minibatch_size
-        incoming_sum = adj_matrix_batch.sum(dim=0) / minibatch_size
+        outgoing_sum = adj_matrix_batch.sum(dim=1) / (minibatch_size//2)
+        incoming_sum = adj_matrix_batch.sum(dim=0) / (minibatch_size//2)
 
         optimizer.zero_grad()
 
@@ -103,17 +113,16 @@ def m_step(n_max_updates=None, optimizer=None):
         logc_sum = log_(CC).sum(dim=1)
         log1c_sum = log_(1-CC).sum(dim=1)
         outgoing = torch.outer(outgoing_sum, logc_sum)
-        outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum, log1c_sum)
+        outgoing = outgoing + torch.outer(1 - outgoing_sum, log1c_sum)
 
         logc_sum = log_(CC).sum(dim=0)
         log1c_sum = log_(1-CC).sum(dim=0)
         incoming = torch.outer(incoming_sum, logc_sum) 
-        incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
+        incoming = incoming + torch.outer(1 - incoming_sum, log1c_sum)
 
-        overall = incoming + outgoing
-        
-        # weighted sum of `overall` using q_probs
-        overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
+        overall = (torch.softmax(q_logits_batch_left, dim=-1) * outgoing).sum(dim=-1)
+        overall = overall + (torch.softmax(q_logits_batch_right, dim=-1) * incoming).sum(dim=-1)
+
         loss = -overall.sum()
 
         loss.backward()
@@ -133,7 +142,7 @@ def m_step(n_max_updates=None, optimizer=None):
 
 
 # EM algorithm
-optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=0.001)
+optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=0.001)
 
 try:
     for epoch in range(n_epochs):
