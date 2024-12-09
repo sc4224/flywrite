@@ -100,13 +100,13 @@ def m_step(n_max_updates=None, optimizer=None):
         logc_sum = log_(CC).sum(dim=1)
         log1c_sum = log_(1-CC).sum(dim=1)
         outgoing = torch.outer(outgoing_sum_batch, logc_sum)
-        # outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum_batch, log1c_sum)
+        # outgoing = outgoing + (outgoing_sum_mean / (1-outgoing_sum_mean)) * torch.outer(1 - outgoing_sum_batch, log1c_sum)
         outgoing = outgoing + torch.outer(1 - outgoing_sum_batch, log1c_sum)
 
         logc_sum = log_(CC).sum(dim=0)
         log1c_sum = log_(1-CC).sum(dim=0)
         incoming = torch.outer(incoming_sum_batch, logc_sum) 
-        # incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum_batch, log1c_sum)
+        # incoming = incoming + (incoming_sum_mean / (1-incoming_sum_mean)) * torch.outer(1 - incoming_sum_batch, log1c_sum)
         incoming = incoming + torch.outer(1 - incoming_sum_batch, log1c_sum)
 
         overall = outgoing + incoming
