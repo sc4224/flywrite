@@ -41,12 +41,12 @@ incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).to(device).sque
 incoming_sum_mean = incoming_sum.mean()
 
 # Model parameters
-U_left = nn.Parameter(1e-1 * torch.randn(K, d, dtype=dtype).to(device))
-U_right = nn.Parameter(1e-1 * torch.randn(K, d, dtype=dtype).to(device))
+U_left = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
+U_right = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
 bias = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device)))
 
 # approximate posterior: must be sampled from a Dirichlet distribution
-q_logits = nn.Parameter(1/np.sqrt(K) * torch.randn(N, K, dtype=dtype).to(device))
+q_logits = nn.Parameter(1/K * torch.randn(N, K, dtype=dtype).to(device))
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -97,14 +97,14 @@ def m_step(n_max_updates=None, optimizer=None):
         # Compute the gradient of the ELBO w.r.t. U_left and U_right
         CC = sigmoid(dot(U_left, U_right) + bias)
 
-        logc_sum = torch.log(CC).sum(dim=1)
-        log1c_sum = torch.log(1-CC).sum(dim=1)
+        logc_sum = log_(CC).sum(dim=1)
+        log1c_sum = log_(1-CC).sum(dim=1)
         outgoing = torch.outer(outgoing_sum_batch, logc_sum)
         # outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum_batch, log1c_sum)
         outgoing = outgoing + torch.outer(1 - outgoing_sum_batch, log1c_sum)
 
-        logc_sum = torch.log(CC).sum(dim=0)
-        log1c_sum = torch.log(1-CC).sum(dim=0)
+        logc_sum = log_(CC).sum(dim=0)
+        log1c_sum = log_(1-CC).sum(dim=0)
         incoming = torch.outer(incoming_sum_batch, logc_sum) 
         # incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum_batch, log1c_sum)
         incoming = incoming + torch.outer(1 - incoming_sum_batch, log1c_sum)
@@ -112,7 +112,7 @@ def m_step(n_max_updates=None, optimizer=None):
         overall = outgoing + incoming
         
         # weighted sum of `overall` using q_probs
-        overall = torch.logsumexp(overall + torch.log(torch.softmax(q_logits_batch, dim=-1)), dim=-1)
+        overall = torch.logsumexp(overall + log_(torch.softmax(q_logits_batch, dim=-1)), dim=-1)
         # overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
         loss = -overall.mean()
 
@@ -120,7 +120,7 @@ def m_step(n_max_updates=None, optimizer=None):
         # q_probs = torch.softmax(q_logits_batch, dim=-1)
         # prior = q_probs * (log_(q_probs) - logK)
         # prior = prior.sum(dim=-1).mean()
-        # loss = loss - 1e-3 * prior
+        # loss = loss - * prior
 
         loss.backward()
 
@@ -128,8 +128,8 @@ def m_step(n_max_updates=None, optimizer=None):
             initial_loss = loss.item()
         final_loss = loss.item()
 
-        # # Clip the gradients to prevent exploding gradients
-        # torch.nn.utils.clip_grad_norm_([U_left, U_right, bias, q_logits], 1.0)
+        # Clip the gradients to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_([U_left, U_right, bias, q_logits], 1.0)
 
         # import ipdb; ipdb.set_trace()
         # Perform a gradient step
