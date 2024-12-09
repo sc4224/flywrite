@@ -12,15 +12,15 @@ if torch.cuda.is_available():
     device="cuda"
 
 # Constants
-K = 64      # Number of clusters: 729
-logK = torch.log(torch.tensor(K))
+K = 128      # Number of clusters: 729
 d = 32       # Dimensionality of feature space
-num_epochs = 2_000
-num_m_updates = 50
+num_m_updates = 10_000
 
 dtype=torch.float32
 if device == "cuda":
     dtype=torch.bfloat16
+
+logK = torch.log(torch.tensor(K, dtype=dtype))
 
 # Load the sparse matrix from `sparse_connectivity_matrix.npz`.
 # The sparse matrix is in the format of csr_matrix.
@@ -33,18 +33,18 @@ N = adj_matrix.shape[0]  # Number of nodes
 print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
 # prepare the incoming and outgoing edge stats
-outgoing_sum = torch.tensor(adj_matrix.sum(axis=1)).squeeze() / N
+outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).squeeze() / N
 outgoing_sum_mean = outgoing_sum.mean()
-incoming_sum = torch.tensor(adj_matrix.sum(axis=0)).squeeze() / N
+incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).squeeze() / N
 incoming_sum_mean = incoming_sum.mean()
 
 # Model parameters
-U_left_mu = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
-U_right_mu = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
-U_left_logs = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
-U_right_logs = nn.Parameter(1e-4 * torch.randn(K, d, dtype=dtype).to(device))
-bias_mu = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()])).to(device))
-bias_logs = nn.Parameter(1e-4 * torch.randn(1, dtype=dtype).to(device))
+U_left = nn.Parameter(1e-1 * torch.randn(K, d, dtype=dtype).to(device))
+U_right = nn.Parameter(1e-1 * torch.randn(K, d, dtype=dtype).to(device))
+bias = nn.Parameter(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device))
+
+# approximate posterior: must be sampled from a Dirichlet distribution
+q_logits = nn.Parameter(1e-1 * torch.randn(N, K, dtype=dtype).to(device))
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -60,42 +60,12 @@ def dot(x, y):
 def cosine(x, y):
     return torch.mm(x, y.t()) / (torch.norm(x, dim=-1) * torch.norm(y, dim=-1))
 
-# E-step: Update q_probs explicitly using dense submatrices
-def compute_q_probs(q_probs_old=None):
-    U_left = U_left_mu + torch.exp(U_left_logs) * torch.randn_like(U_left_mu)
-    U_right = U_right_mu + torch.exp(U_right_logs) * torch.randn_like(U_right_mu)
-    bias = bias_mu + torch.exp(bias_logs) * torch.randn_like(bias_mu)
-    CC = sigmoid(dot(U_left, U_right) + bias)
-
-    logc_sum = log_(CC).sum(dim=1)
-    log1c_sum = log_(1-CC).sum(dim=1)
-    outgoing = torch.outer(outgoing_sum, logc_sum) 
-    outgoing = outgoing + torch.outer(1 - outgoing_sum, log1c_sum)
-
-    logc_sum = log_(CC).sum(dim=0)
-    log1c_sum = log_(1-CC).sum(dim=0)
-    incoming = torch.outer(incoming_sum, logc_sum) 
-    incoming = incoming + torch.outer(1 - incoming_sum, log1c_sum)
-
-    overall = incoming + outgoing
-
-    if q_probs_old is None:
-        q_probs = torch.softmax(overall, dim=-1)
-    else:
-        q_probs = 0.9 * q_probs_old + 0.1 * torch.softmax(overall, dim=-1)
-
-    if torch.isnan(q_probs).any():
-        print("NaNs detected in q_probs!")
-        import ipdb; ipdb.set_trace()
-
-    return q_probs.detach()
-
 # M-step: Update U_left and U_right
-def m_step(q_probs, n_max_updates=None, optimizer=None):
+def m_step(n_max_updates=None, optimizer=None):
     if n_max_updates is None:
         n_max_updates = 1
     if optimizer is None:
-        optimizer = torch.optim.Adam([U_left_mu, U_right_mu, U_left_logs, U_right_logs, bias_mu, bias_logs], lr=0.001)
+        optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=0.001)
 
     initial_loss = 0.
     final_loss = 0.
@@ -104,33 +74,24 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
         optimizer.zero_grad()
 
         # Compute the gradient of the ELBO w.r.t. U_left and U_right
-        U_left = U_left_mu + torch.exp(U_left_logs) * torch.randn_like(U_left_mu)
-        U_right = U_right_mu + torch.exp(U_right_logs) * torch.randn_like(U_right_mu)
-        bias = bias_mu + torch.exp(bias_logs) * torch.randn_like(bias_mu)
         CC = sigmoid(dot(U_left, U_right) + bias)
 
         logc_sum = log_(CC).sum(dim=1)
         log1c_sum = log_(1-CC).sum(dim=1)
         outgoing = torch.outer(outgoing_sum, logc_sum)
-        outgoing = outgoing + torch.outer(1 - outgoing_sum, log1c_sum)
+        outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum, log1c_sum)
 
         logc_sum = log_(CC).sum(dim=0)
         log1c_sum = log_(1-CC).sum(dim=0)
         incoming = torch.outer(incoming_sum, logc_sum) 
-        incoming = incoming + torch.outer(1 - incoming_sum, log1c_sum)
+        incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum, log1c_sum)
 
         overall = incoming + outgoing
         
         # weighted sum of `overall` using q_probs
-        overall = (q_probs * overall).sum(dim=-1)
+        overall = (torch.softmax(q_logits, dim=-1) * overall).sum(dim=-1)
         loss = -overall.sum()
 
-        # KL divergence between Normal(U_left_mu, U_left_logs) and Normal(0, 1)
-        kl_left = 0.5 * (U_left_mu.pow(2) + U_left_logs.exp() - 1 - U_left_logs).sum()
-        # KL divergence between Normal(U_right_mu, U_right_logs) and Normal(0, 1)
-        kl_right = 0.5 * (U_right_mu.pow(2) + U_right_logs.exp() - 1 - U_right_logs).sum()
-
-        loss += 1. * (kl_left + kl_right)
         loss.backward()
 
         if i == 0:
@@ -138,12 +99,16 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
         final_loss = loss.item()
 
         # Clip the gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_([U_left_mu, U_right_mu, 
-                                        U_left_logs, U_right_logs, 
-                                        bias_mu, bias_logs], 1.0)
+        torch.nn.utils.clip_grad_norm_([U_left, U_right, bias, q_logits], 1.0)
 
         # Perform a gradient step
         optimizer.step()
+
+        if i % 10 == 0:
+            print(f"Loss at iteration {i}: {loss.item()}")
+            print("Cluster assignments:")
+            for i in range(10):
+                print(f"Node {i}: Cluster {torch.argmax(q_logits[i]).item()}")
 
     # import ipdb; ipdb.set_trace()
 
@@ -151,34 +116,21 @@ def m_step(q_probs, n_max_updates=None, optimizer=None):
 
 
 # EM algorithm
-optimizer = torch.optim.AdamW([U_left_mu, U_right_mu, 
-                               U_left_logs, U_right_logs, 
-                               bias_mu, bias_logs], lr=0.001)
-
-q_probs = None
+optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=0.001)
 
 try:
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch + 1}/{num_epochs}")
-
-        # E-step: Update q_probs explicitly using dense submatrices
-        q_probs = compute_q_probs(q_probs_old=None)
-        # now print the cluster assignments of the first 10 items.
-        # make sure to print their log-probabilities (up to 3 digits) as well.
-        print("Cluster assignments:")
-        for i in range(10):
-            print(f"Node {i}: Cluster {torch.argmax(q_probs[i]).item()} (Prob: {q_probs[i].max().item():.3f})")
-
-        # M-step: Update U_left and U_right
-        m_step(q_probs, n_max_updates=num_m_updates, optimizer=optimizer)
+    # M-step: Update U_left and U_right
+    m_step(n_max_updates=num_m_updates, optimizer=optimizer)
 except KeyboardInterrupt:
     print("Training interrupted.")
 
 # Save results
-cluster_assignments = torch.argmax(q_probs, dim=-1).cpu().numpy()  # Inferred cluster for each node
-cluster_scores = torch.max(q_probs, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
-U_left_final = U_left_mu.detach().cpu().numpy()
-U_right_final = U_right_mu.detach().cpu().numpy()
+cluster_assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()  # Inferred cluster for each node
+cluster_scores = torch.max(q_logits, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
+U_left_final = U_left.detach().cpu().numpy()
+U_right_final = U_right.detach().cpu().numpy()
+# U_left_final = U_left_mu.detach().cpu().numpy()
+# U_right_final = U_right_mu.detach().cpu().numpy()
 
 # build a index-to-root_id dictionary
 from index_mapping import load_mapping, matrix_index_to_root_id
