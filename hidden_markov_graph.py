@@ -6,8 +6,8 @@ from tqdm import tqdm
 import gc
 
 device="cpu"
-# if torch.backends.mps.is_available():
-#     device="mps"
+if torch.backends.mps.is_available():
+    device="mps"
 if torch.cuda.is_available():
     device="cuda"
 
@@ -35,9 +35,9 @@ N = adj_matrix.shape[0]  # Number of nodes
 print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
 # prepare the incoming and outgoing edge stats
-outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).squeeze() / N
+outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).to(device).squeeze() / N
 outgoing_sum_mean = outgoing_sum.mean()
-incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).squeeze() / N
+incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).to(device).squeeze() / N
 incoming_sum_mean = incoming_sum.mean()
 
 # Model parameters
@@ -97,27 +97,30 @@ def m_step(n_max_updates=None, optimizer=None):
         # Compute the gradient of the ELBO w.r.t. U_left and U_right
         CC = sigmoid(dot(U_left, U_right) + bias)
 
-        logc_sum = log_(CC).sum(dim=1)
-        log1c_sum = log_(1-CC).sum(dim=1)
+        logc_sum = torch.log(CC).sum(dim=1)
+        log1c_sum = torch.log(1-CC).sum(dim=1)
         outgoing = torch.outer(outgoing_sum_batch, logc_sum)
-        outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum_batch, log1c_sum)
+        # outgoing = outgoing + outgoing_sum_mean * torch.outer(1 - outgoing_sum_batch, log1c_sum)
+        outgoing = outgoing + torch.outer(1 - outgoing_sum_batch, log1c_sum)
 
-        logc_sum = log_(CC).sum(dim=0)
-        log1c_sum = log_(1-CC).sum(dim=0)
+        logc_sum = torch.log(CC).sum(dim=0)
+        log1c_sum = torch.log(1-CC).sum(dim=0)
         incoming = torch.outer(incoming_sum_batch, logc_sum) 
-        incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum_batch, log1c_sum)
+        # incoming = incoming + incoming_sum_mean * torch.outer(1 - incoming_sum_batch, log1c_sum)
+        incoming = incoming + torch.outer(1 - incoming_sum_batch, log1c_sum)
 
         overall = outgoing + incoming
         
         # weighted sum of `overall` using q_probs
-        overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
-        loss = -overall.sum()
+        overall = torch.logsumexp(overall + torch.log(torch.softmax(q_logits_batch, dim=-1)), dim=-1)
+        # overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
+        loss = -overall.mean()
 
         # # compute the prior term on q_logits
         # q_probs = torch.softmax(q_logits_batch, dim=-1)
         # prior = q_probs * (log_(q_probs) - logK)
-        # prior = prior.sum()
-        # loss = loss + prior
+        # prior = prior.sum(dim=-1).mean()
+        # loss = loss - 1e-3 * prior
 
         loss.backward()
 
@@ -128,15 +131,15 @@ def m_step(n_max_updates=None, optimizer=None):
         # # Clip the gradients to prevent exploding gradients
         # torch.nn.utils.clip_grad_norm_([U_left, U_right, bias, q_logits], 1.0)
 
+        # import ipdb; ipdb.set_trace()
         # Perform a gradient step
         optimizer.step()
-    # import ipdb; ipdb.set_trace()
-
+    
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
 
 
 # EM algorithm
-optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=0.001)
+optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=1e-1)
 
 try:
     for epoch in range(n_epochs):
