@@ -73,7 +73,8 @@ def m_step(n_max_updates=None, optimizer=None):
     final_loss = 0.
 
     # create a random permutation of the indices
-    indices = torch.randperm(N, device=device)
+    indices_i = torch.randperm(N, device=device)
+    indices_j = torch.randperm(N, device=device)
     n_minibatches = N // minibatch_size
 
     for i in tqdm(range(n_minibatches)):
@@ -83,45 +84,36 @@ def m_step(n_max_updates=None, optimizer=None):
             break
 
         # Get the minibatch indices
-        minibatch_indices = indices[i * minibatch_size: (i + 1) * minibatch_size]
+        minibatch_indices_i = indices_i[i * minibatch_size: (i + 1) * minibatch_size]
+        minibatch_indices_j = indices_j[i * minibatch_size: (i + 1) * minibatch_size]
 
         # Get the minibatch of q_logits
-        q_logits_batch = q_logits[minibatch_indices]
+        q_probs_batch_i = torch.softmax(q_logits[minibatch_indices_i], dim=-1) # mb_size x K 
+        q_probs_batch_j = torch.softmax(q_logits[minibatch_indices_j], dim=-1) # mb_size x K
 
-        # get the minibatch of adjacency matrix
-        outgoing_sum_batch = outgoing_sum[minibatch_indices]
-        incoming_sum_batch = incoming_sum[minibatch_indices]
+        # get the sub-matrix of adjacency matrix
+        CC = torch.tensor(adj_matrix[minibatch_indices_i.cpu().numpy()]
+                          [:, minibatch_indices_j.cpu().numpy()].toarray(), 
+                          dtype=dtype).to(device) # mb_size x mb_size
+
+        # outer product of q_logits_batch_i and q_logits_batch_j
+        edge_weighted_KK = torch.mm(q_probs_batch_i.t(), torch.mm(CC, q_probs_batch_j)) # K x K
+        non_edge_weighted_KK = torch.mm(q_probs_batch_i.t(), torch.mm(1-CC, q_probs_batch_j)) # K x K
         
+        # compute the edge probabilities
+        e_prob = sigmoid(dot(U_left, U_right) + bias) # K x K
+
+        # compute the objective function
+        obj = (edge_weighted_KK * log_(e_prob)).sum() + (non_edge_weighted_KK * log_(1 - e_prob)).sum()
+
+        # add the entropy penalty on q_probs
+        obj = obj - (q_probs_batch_i * log_(q_probs_batch_i)).mean() / 2 - (q_probs_batch_j * log_(q_probs_batch_j)).mean() / 2
+
+        # compute the loss
+        loss = -obj
+
+        # Zero the gradients
         optimizer.zero_grad()
-
-        # Compute the gradient of the ELBO w.r.t. U_left and U_right
-        CC = sigmoid(dot(U_left, U_right) + bias)
-
-        logc_sum = log_(CC).sum(dim=1)
-        log1c_sum = log_(1-CC).sum(dim=1)
-        outgoing = torch.outer(outgoing_sum_batch, logc_sum)
-        # outgoing = outgoing + (outgoing_sum_mean / (1-outgoing_sum_mean)) * torch.outer(1 - outgoing_sum_batch, log1c_sum)
-        outgoing = outgoing + torch.outer(1 - outgoing_sum_batch, log1c_sum)
-
-        logc_sum = log_(CC).sum(dim=0)
-        log1c_sum = log_(1-CC).sum(dim=0)
-        incoming = torch.outer(incoming_sum_batch, logc_sum) 
-        # incoming = incoming + (incoming_sum_mean / (1-incoming_sum_mean)) * torch.outer(1 - incoming_sum_batch, log1c_sum)
-        incoming = incoming + torch.outer(1 - incoming_sum_batch, log1c_sum)
-
-        overall = outgoing + incoming
-        
-        # weighted sum of `overall` using q_probs
-        overall = torch.logsumexp(overall + log_(torch.softmax(q_logits_batch, dim=-1)), dim=-1)
-        # overall = (torch.softmax(q_logits_batch, dim=-1) * overall).sum(dim=-1)
-        loss = -overall.mean()
-
-        # # compute the prior term on q_logits
-        # q_probs = torch.softmax(q_logits_batch, dim=-1)
-        # prior = q_probs * (log_(q_probs) - logK)
-        # prior = prior.sum(dim=-1).mean()
-        # loss = loss - * prior
-
         loss.backward()
 
         if i == 0:
