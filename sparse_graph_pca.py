@@ -34,7 +34,7 @@ def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, 
     W_coo = W_csr.tocoo()
 
     # Initialize Adam optimizer
-    optimizer = torch.optim.Adam([U], lr=lr)
+    optimizer = torch.optim.Adam([U, b], lr=lr)
 
     try:
         # Optimization loop
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
     # Perform stochastic PCA
-    n_components = 128
+    n_components = 32
     U, b = stochastic_pca(adj_matrix, 
                           n_components, 
                           batch_size=512, 
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     U_orth = orthogonalize(U)
 
     # Perform k-means clustering
-    n_clusters = 729  # Number of clusters
+    n_clusters = 1024  # Number of clusters
     cluster_centers, labels, min_distances = kmeans_clustering(U_orth, n_clusters, device=device)
 
     print("Cluster centers shape:", cluster_centers.shape)
