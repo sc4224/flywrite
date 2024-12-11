@@ -135,8 +135,14 @@ if __name__ == "__main__":
     print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
     # Perform stochastic PCA
-    n_components = 32
-    U, b = stochastic_pca(adj_matrix, n_components, batch_size=128, lr=0.01, max_iter=10_000, tol=1e-6, device=device)
+    n_components = 128
+    U, b = stochastic_pca(adj_matrix, 
+                          n_components, 
+                          batch_size=512, 
+                          lr=0.01, 
+                          max_iter=10_000,
+                          tol=1e-6, 
+                          device=device)
     
     # Orthogonalize U to obtain principal components
     U_orth = orthogonalize(U)

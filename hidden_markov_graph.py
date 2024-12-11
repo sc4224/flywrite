@@ -13,7 +13,7 @@ if torch.cuda.is_available():
 
 # Constants
 K = 729      # Number of clusters: 729
-d = 32       # Dimensionality of feature space
+d = 128       # Dimensionality of feature space
 minibatch_size = 5_000
 num_m_updates = 10_000
 n_epochs = 1_000
@@ -107,7 +107,8 @@ def m_step(n_max_updates=None, optimizer=None):
         obj = (edge_weighted_KK * log_(e_prob)).sum() + (non_edge_weighted_KK * log_(1 - e_prob)).sum()
 
         # add the entropy penalty on q_probs
-        obj = obj - (q_probs_batch_i * log_(q_probs_batch_i)).mean() / 2 - (q_probs_batch_j * log_(q_probs_batch_j)).mean() / 2
+        obj = obj - (q_probs_batch_i * log_(q_probs_batch_i)).sum(1).mean() / 2 
+        obj = obj - (q_probs_batch_j * log_(q_probs_batch_j)).sum(1).mean() / 2
 
         # compute the loss
         loss = -obj
