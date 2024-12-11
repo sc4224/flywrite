@@ -15,11 +15,11 @@ i've used the following file to map a root id to its name:
 ```
 > pip install -r ./requirements.txt
 > python ./connectivity_matrix_construction.py
+> python ./visual_neuron_type_dict.py
 > python ./hidden_markov_graph.py
+> python ./sparse_graph_pca.py
 ```
 
-then you should end up with
+## For analysis
 
-* `cluster_assignments.npy`: the cluster assignment
-* `U_posterior_mean.npy`: the cluster feature vectors
-
+use `cluster_similarity_test.ipynb` with jupyter notebook.

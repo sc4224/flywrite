@@ -5,11 +5,16 @@ import numpy as np
 from tqdm import tqdm
 import gc
 
+from datetime import datetime
+
 device="cpu"
 if torch.backends.mps.is_available():
     device="mps"
 if torch.cuda.is_available():
     device="cuda"
+
+# set the global seed using torch. use the current time to make it more random.
+torch.manual_seed(int(datetime.now().timestamp()))
 
 # Constants
 K = 1024      # Number of clusters: 729
