@@ -23,3 +23,12 @@ i've used the following file to map a root id to its name:
 ## For analysis
 
 use `cluster_similarity_test.ipynb` with jupyter notebook.
+
+## Write up
+
+see https://hackmd.io/@9fLGzJeaT7aed7WxUT4VPA/S1hv-9iX1g for more details.
+
+## Commit history
+
+don't bother with the commit history, as this history is more or less how i was misled constantly over several days if not weeks by ChatGPT and did not realized i was being misled.
+
