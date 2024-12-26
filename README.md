@@ -26,7 +26,7 @@ use `cluster_similarity_test.ipynb` with jupyter notebook.
 
 ## Write up
 
-see https://hackmd.io/@9fLGzJeaT7aed7WxUT4VPA/S1hv-9iX1g for more details.
+see [<Stochastic variational inference for low-rank stochastic block models, or how i re-discovered SBM unnecessarily>](https://kyunghyuncho.me/stochastic-variational-inference-for-low-rank-stochastic-block-models-or-how-i-re-discovered-sbm-unnecessarily/) for more details.
 
 ## Commit history
 
