@@ -12,7 +12,7 @@ def create_root_id_type_dict(input_file, output_file):
 
     # Create the dictionary (root_id, type)
     print("Creating dictionary...")
-    root_id_type_dict = dict(zip(df['root_id'], df['type']))
+    root_id_type_dict = dict(zip(df['root_id'], df['group']))
 
     # Save the dictionary as a pickle file
     print("Saving dictionary as pickle file...")
