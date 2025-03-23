@@ -1,10 +1,22 @@
 import torch
 from scipy.sparse import csr_matrix, load_npz
+from sklearn.metrics import silhouette_score
 import numpy as np
 from tqdm import tqdm
 
+from skopt import gp_minimize
+from skopt.space import Integer, Real, Categorical
+from skopt.utils import use_named_args
 
-def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, device="cuda"):
+space = [
+    Integer(5, 32, name='n_components'),
+    Integer(256, 4096, prior='log-uniform', name='k'),
+    Real(1e-4, 1e-1, prior='log-uniform', name='learning_rate'),
+    Integer(50, 200, name='n_epochs'),
+    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')  # Optimizer choice
+]
+
+def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, optimizer_choice="Adam",device="cuda"):
     """
     Perform stochastic PCA on a sparse matrix to minimize || U U^T W - W ||^2_F.
 
@@ -35,6 +47,12 @@ def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, 
 
     # Initialize Adam optimizer
     optimizer = torch.optim.Adam([U, b], lr=lr)
+    if optimizer_choice == 'Adam':
+        optimizer = torch.optim.Adam([U, b], lr=lr)
+    elif optimizer_choice == 'SGD':
+        optimizer = torch.optim.SGD([U, b], lr=lr)
+    elif optimizer_choice == 'AdamW':
+        optimizer = torch.optim.AdamW([U, b], lr=lr)
 
     try:
         # Optimization loop
@@ -120,6 +138,44 @@ def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
 
     return cluster_centers, labels, min_distances
 
+@use_named_args
+def objective(**params):
+    n_components = params["n_components"]
+    n_clusters = params["k"]
+    learning_rate = params["learning_rate"]
+    n_epochs = params["n_epochs"]
+    optimizer_choice = params["optimizer"]
+
+    # Load the sparse matrix
+    file_path = "./sparse_connectivity_matrix.npz"
+    adj_matrix = load_npz(file_path)
+    print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+
+    U, b = stochastic_pca(adj_matrix, 
+                      n_components, 
+                      batch_size=512, 
+                      lr=learning_rate, 
+                      max_iter=10_000,
+                      tol=1e-6,
+                      optimizer_choice=optimizer_choice,
+                      device=device)
+    
+    # Orthogonalize U to obtain principal components
+    U_orth = orthogonalize(U)
+
+    cluster_centers, labels, min_distances = kmeans_clustering(U_orth, n_clusters, device=device)
+
+    print("Cluster centers shape:", cluster_centers.shape)
+    print("Cluster labels shape:", labels.shape)
+    print("Distances to cluster centers shape:", min_distances.shape)
+
+    # Compute the silhouette score.
+    score = silhouette_score(U_orth, labels)
+    
+    # Since gp_minimize minimizes the objective, return the negative silhouette score.
+    return -score
+
+
 
 if __name__ == "__main__":
     # Set device
@@ -129,49 +185,40 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         device="cuda"
 
-    # Load the sparse matrix
-    file_path = "./sparse_connectivity_matrix.npz"
-    adj_matrix = load_npz(file_path)
-    print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+#    # Perform stochastic PCA
+#    n_components = 32
+#
+#    # Perform k-means clustering
+#    n_clusters = 1024  # Number of clusters
 
-    # Perform stochastic PCA
-    n_components = 32
-    U, b = stochastic_pca(adj_matrix, 
-                          n_components, 
-                          batch_size=512, 
-                          lr=0.01, 
-                          max_iter=10_000,
-                          tol=1e-6, 
-                          device=device)
-    
-    # Orthogonalize U to obtain principal components
-    U_orth = orthogonalize(U)
+    res_gp = gp_minimize(objective, space, n_calls=50, random_state=42)
 
-    # Perform k-means clustering
-    n_clusters = 1024  # Number of clusters
-    cluster_centers, labels, min_distances = kmeans_clustering(U_orth, n_clusters, device=device)
+    # Print the results.
+    print("Best silhouette score: {:.4f}".format(None if res_gp is None else -res_gp.fun))
+    print("Best hyperparameters:")
+    print("  n_components:", None if res_gp is None else res_gp.x[0])
+    print("  k (clusters):", None if res_gp is None else res_gp.x[1])
+    print("  learning_rate:", None if res_gp is None else res_gp.x[2])
+    print("  n_epochs:", None if res_gp is None else res_gp.x[3])
+    print("  optimizer:", None if res_gp is None else res_gp.x[4])
 
-    print("Cluster centers shape:", cluster_centers.shape)
-    print("Cluster labels shape:", labels.shape)
-    print("Distances to cluster centers shape:", min_distances.shape)
-
-    # build a index-to-root_id dictionary
-    from index_mapping import load_mapping
-
-    mapping = load_mapping('./root_id_to_index_mapping.json')
-    rootid_mapping = dict((v, k) for k, v in mapping.items())
+#    # build a index-to-root_id dictionary
+#    from index_mapping import load_mapping
+#
+#    mapping = load_mapping('./root_id_to_index_mapping.json')
+#    rootid_mapping = dict((v, k) for k, v in mapping.items())
 
     # build a cluster assignment dictionary
-    cluster_assignment_dict = dict()
-    for i in range(len(labels)):
-        root_id = mapping[i]
-        cluster_assignment_dict[root_id] = labels[i].item()
-
-    # Save the results
-    torch.save(U_orth.cpu(), 'U_orth.pt')
-    print("Saved U and U_orth to disk.")
-
-    torch.save(cluster_centers.cpu(), 'pca_cluster_centers.pt')
-    torch.save(labels.cpu(), 'pca_labels.pt')
-    torch.save(min_distances.cpu(), 'pca_min_distances.pt')
-    np.save("pca_cluster_assignment_dict.npy", cluster_assignment_dict, allow_pickle=True)
+#    cluster_assignment_dict = dict()
+#    for i in range(len(labels)):
+#        root_id = mapping[i]
+#        cluster_assignment_dict[root_id] = labels[i].item()
+#
+#    # Save the results
+#    torch.save(U_orth.cpu(), 'U_orth.pt')
+#    print("Saved U and U_orth to disk.")
+#
+#    torch.save(cluster_centers.cpu(), 'pca_cluster_centers.pt')
+#    torch.save(labels.cpu(), 'pca_labels.pt')
+#    torch.save(min_distances.cpu(), 'pca_min_distances.pt')
+#    np.save("pca_cluster_assignment_dict.npy", cluster_assignment_dict, allow_pickle=True)

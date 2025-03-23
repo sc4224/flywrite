@@ -4,8 +4,13 @@ from scipy.sparse import csr_matrix, load_npz
 import numpy as np
 from tqdm import tqdm
 import gc
+import wandb as wdb
 
 from datetime import datetime
+
+run = wdb.init(
+    project="flywrite",
+)
 
 device="cpu"
 if torch.backends.mps.is_available():
@@ -16,9 +21,9 @@ if torch.cuda.is_available():
 # set the global seed using torch. use the current time to make it more random.
 torch.manual_seed(int(datetime.now().timestamp()))
 
-# constants
-k = 1024      # number of clusters: 729
-d = 32       # dimensionality of feature space
+# Constants
+K = 1024      # Number of clusters: 729
+d = 32       # Dimensionality of feature space
 minibatch_size = 2_500
 num_m_updates = 10_000
 n_epochs = 1_000
@@ -27,31 +32,34 @@ dtype=torch.float32
 if device == "cuda":
     dtype=torch.bfloat16
 
-logk = torch.log(torch.tensor(k, dtype=dtype))
+logK = torch.log(torch.tensor(K, dtype=dtype))
 
-# load the sparse matrix from `sparse_connectivity_matrix.npz`.
-# the sparse matrix is in the format of csr_matrix.
+# Load the sparse matrix from `sparse_connectivity_matrix.npz`.
+# The sparse matrix is in the format of csr_matrix.
 adj_matrix = load_npz("./sparse_connectivity_matrix.npz")
 
-# threshold the sparse matrix to obtain a binary adjacency matrix
+# Threshold the sparse matrix to obtain a binary adjacency matrix
 adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
 
-n = adj_matrix.shape[0]  # number of nodes
-print(f"loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+N = adj_matrix.shape[0]  # Number of nodes
+print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
 # prepare the incoming and outgoing edge stats
-outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).to(device).squeeze() / n
+outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).to(device).squeeze() / N
 outgoing_sum_mean = outgoing_sum.mean()
-incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).to(device).squeeze() / n
+incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).to(device).squeeze() / N
 incoming_sum_mean = incoming_sum.mean()
 
-# model parameters
-u_left = nn.Parameter(1/np.sqrt(k * d) * torch.randn(k, d, dtype=dtype).to(device))
-u_right = nn.Parameter(1/np.sqrt(k * d) * torch.randn(k, d, dtype=dtype).to(device))
+# Model parameters
+U_left = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
+U_right = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
 bias = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device)))
 
-# approximate posterior: must be sampled from a dirichlet distribution
-q_logits = nn.Parameter(1/k * torch.randn(n, k, dtype=dtype).to(device))
+tr = torch.randn(N, K, dtype=dtype)
+# approximate posterior: must be sampled from a Dirichlet distribution
+q_logits = nn.Parameter(1/K * tr.to(device))
+
+# breakpoint()
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -67,7 +75,7 @@ def dot(x, y):
 def cosine(x, y):
     return torch.mm(x, y.t()) / (torch.norm(x, dim=-1) * torch.norm(y, dim=-1))
 
-# m-step: update u_left and u_right
+# M-step: Update U_left and U_right
 def m_step(n_max_updates=None, optimizer=None):
     if n_max_updates is None:
         n_max_updates = 1
@@ -95,10 +103,10 @@ def m_step(n_max_updates=None, optimizer=None):
         # Get the minibatch of q_logits
         q_probs_batch_i = torch.softmax(q_logits[minibatch_indices_i], dim=-1) # mb_size x K 
         q_probs_batch_j = torch.softmax(q_logits[minibatch_indices_j], dim=-1) # mb_size x K
-        
-        eps = 1e-10
-        q_probs_batch_i = torch.clamp(q_probs_batch_i, eps, 1 - eps)
-        q_probs_batch_j = torch.clamp(q_probs_batch_j, eps, 1 - eps)
+
+        # eps = 1e-10
+        # q_probs_batch_i = torch.clamp(q_probs_batch_i, eps, 1 - eps)
+        # q_probs_batch_j = torch.clamp(q_probs_batch_j, eps, 1 - eps)
 
         # get the sub-matrix of adjacency matrix
         CC = torch.tensor(adj_matrix[minibatch_indices_i.cpu().numpy()]
@@ -111,22 +119,10 @@ def m_step(n_max_updates=None, optimizer=None):
         
         # compute the edge probabilities
         e_prob = sigmoid(dot(U_left, U_right) + bias) # K x K
-        e_prob = torch.clamp(e_prob, eps, 1 - eps)
+        # e_prob = torch.clamp(e_prob, eps, 1 - eps)
 
         # compute the objective function
         obj = (edge_weighted_KK * log_(e_prob)).sum() + (non_edge_weighted_KK * log_(1 - e_prob)).sum()
-        
-        if i == n_minibatches-1:
-            print("minibatch-i", minibatch_indices_i)
-            print("minibatch-j", minibatch_indices_j)
-            print("q-logits", q_logits)
-            print("q-probs-i", q_probs_batch_i)
-            print("q-probs-j", q_probs_batch_j)
-            print("sub-matrix", CC)
-            print("edge-weighted", edge_weighted_KK)
-            print("non-edge-weighted", non_edge_weighted_KK)
-            print("e-prob", e_prob)
-            print("objective", obj)
 
         # add the entropy penalty on q_probs
         obj = obj - (q_probs_batch_i * log_(q_probs_batch_i)).sum(1).mean() / 2 
@@ -139,6 +135,18 @@ def m_step(n_max_updates=None, optimizer=None):
         optimizer.zero_grad()
         loss.backward()
 
+        wdb.log({
+            "edge-weighted": torch.norm(edge_weighted_KK),
+            "non-edge-weighted": torch.norm(non_edge_weighted_KK),
+            "lr": get_lr(optimizer),
+            "iteration": i,
+            "U_left": torch.norm(U_left),
+            "U_right": torch.norm(U_right),
+            "bias": bias[0],
+            "loss": loss,
+            "q_logits": torch.norm(q_logits)
+        })
+
         if i == 0:
             initial_loss = loss.item()
         final_loss = loss.item()
@@ -149,12 +157,21 @@ def m_step(n_max_updates=None, optimizer=None):
         # import ipdb; ipdb.set_trace()
         # Perform a gradient step
         optimizer.step()
+
+        # with torch.no_grad():
+        #     q_logits.clamp_(-10,10)
     
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
 
 
 # EM algorithm
-optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=1e-1)
+optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=1e-2)
+
+def get_lr(optimizer):
+    result = []
+    for param_group in optimizer.param_groups:
+        result.append(param_group['lr'])
+    return sum(result) / len(result)
 
 try:
     for epoch in range(n_epochs):
@@ -193,3 +210,6 @@ np.save("U_right.npy", U_right_final)
 np.save("cluster_assignment_dict.npy", cluster_assignment_dict)
 
 print("Results saved: 'cluster_assignments.npy', 'U_left.npy', 'U_right.npy', 'cluster_assignment_dict.npy'")
+# custom save and load function for weights and biases
+# put in folder, iteration i
+# validation set, overfit risk

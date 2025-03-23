@@ -6,3 +6,7 @@ __pycache__
 *.npy
 *.npz
 *.pt
+iteration1
+iteration2
+wandb
+.ipynb_checkpoints
