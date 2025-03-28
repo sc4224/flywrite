@@ -3,18 +3,22 @@ from scipy.sparse import csr_matrix, load_npz
 from sklearn.metrics import silhouette_score
 import numpy as np
 from tqdm import tqdm
+import wandb as wdb
+from joblib import Parallel, delayed
 
-from skopt import gp_minimize
+from skopt import Optimizer, gp_minimize
 from skopt.space import Integer, Real, Categorical
 from skopt.utils import use_named_args
 
 space = [
-    Integer(5, 32, name='n_components'),
+    Integer(24, 40, name='n_components'),
     Integer(256, 4096, prior='log-uniform', name='k'),
     Real(1e-4, 1e-1, prior='log-uniform', name='learning_rate'),
-    Integer(50, 200, name='n_epochs'),
+    Integer(5000, 15000, name='n_epochs'),
     Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')  # Optimizer choice
 ]
+
+
 
 def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, optimizer_choice="Adam",device="cuda"):
     """
@@ -33,6 +37,7 @@ def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, 
         U: Learned principal components matrix (N x d).
     """
     print("Initializing stochastic PCA...")
+    print("optimizer", optimizer_choice)
 
     N, M = W_csr.shape  # Number of rows (N) and columns (features, M)
     d = n_components
@@ -79,17 +84,32 @@ def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, 
             # Backpropagate the loss
             loss.backward()
 
+            torch.nn.utils.clip_grad_norm_([U, b], max_norm=1.0)
+
+            #wdb.log({
+            #    "lr": get_lr(optimizer),
+            #    "iteration": it,
+            #    "bias": b[0],
+            #    "loss": loss,
+            #    "U_batch": torch.norm(U[batch_indices]),
+            #    "UT_W": torch.norm(UT_W),
+            #    "W_batch": torch.norm(W_batch),
+            #    "W_reconstructed": torch.norm(W_reconstructed),
+            #})
+
             # Perform an Adam optimization step
             optimizer.step()
 
-            # # Re-normalize U after the update
-            # with torch.no_grad():
-            #     U_batch_norm = torch.norm(U_batch, dim=1, keepdim=True)
-            #     U[batch_indices] = U_batch / U_batch_norm.clamp(min=1e-8)  # Prevent division by zero
+#             # Re-normalize U after the update
+#            with torch.no_grad():
+#                U_batch_norm = torch.norm(U_batch, dim=1, keepdim=True)
+#                U[batch_indices] = U_batch / U_batch_norm.clamp(min=1e-8)  # Prevent division by zero
 
             # Check convergence (optional: compute full loss occasionally)
             if it % 100 == 0:
                 print(f"Iteration {it}: Batch loss = {loss.item()}")
+                print("batch indices", batch_indices[:10])
+                print("U batch", torch.isnan(U_batch))
                 if loss.item() < tol:
                     print(f"Converged at iteration {it} with batch loss = {loss.item()}")
                     break
@@ -119,6 +139,8 @@ def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
     indices = torch.randint(0, n_samples, (n_clusters,), device=device)
     cluster_centers = data[indices]
 
+    labels = None
+
     for i in range(max_iter):
         distances = torch.cdist(data, cluster_centers, p=2)
         labels = torch.argmin(distances, dim=1)
@@ -133,13 +155,18 @@ def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
         cluster_centers = new_cluster_centers
 
     # Calculate distances to the assigned cluster centers for each example
-    distances = torch.cdist(data, cluster_centers, p=2)
-    min_distances = distances.gather(1, labels.unsqueeze(1)).squeeze()
+    if labels is not None:
+        distances = torch.cdist(data, cluster_centers, p=2)
+        min_distances = distances.gather(1, labels.unsqueeze(1)).squeeze()
 
-    return cluster_centers, labels, min_distances
+        return cluster_centers, labels, min_distances
 
-@use_named_args
+@use_named_args(space)
 def objective(**params):
+    #run = wdb.init(
+    #    project="flywrite",
+    #)
+
     n_components = params["n_components"]
     n_clusters = params["k"]
     learning_rate = params["learning_rate"]
@@ -155,7 +182,7 @@ def objective(**params):
                       n_components, 
                       batch_size=512, 
                       lr=learning_rate, 
-                      max_iter=10_000,
+                      max_iter=n_epochs,
                       tol=1e-6,
                       optimizer_choice=optimizer_choice,
                       device=device)
@@ -174,8 +201,78 @@ def objective(**params):
     
     # Since gp_minimize minimizes the objective, return the negative silhouette score.
     return -score
+    # avg_min_distance = min_distances.mean().item()
 
+    # return avg_min_distance
 
+def get_lr(optimizer):
+    result = []
+    for param_group in optimizer.param_groups:
+        result.append(param_group['lr'])
+    return sum(result) / len(result)
+
+def run_pca_kmeans(device="cuda"):
+    # Perform stochastic PCA
+    n_components = 32
+
+    # Perform k-means clustering
+    n_clusters = 1024  # Number of clusters
+
+    # Load the sparse matrix
+    file_path = "./sparse_connectivity_matrix.npz"
+    adj_matrix = load_npz(file_path)
+    print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+
+    U, b = stochastic_pca(adj_matrix, 
+                      n_components, 
+                      batch_size=512, 
+                      lr=0.01, 
+                      max_iter=10000,
+                      tol=1e-6,
+                      optimizer_choice="Adam",
+                      device=device)
+    
+    # Orthogonalize U to obtain principal components
+    U_orth = orthogonalize(U)
+    # Run k-means once and return cluster centers.
+    centers, _, _ = kmeans_clustering(U_orth, n_clusters, device=device)
+    return centers
+
+def align_centers(reference, centers):
+    """
+    Align the cluster centers from one run to the reference using the Hungarian algorithm.
+    Both `reference` and `centers` are assumed to be tensors of shape (n_clusters, n_features).
+    Returns the centers reordered to best match the reference.
+    """
+    # Compute the cost matrix (Euclidean distances)
+    cost_matrix = torch.cdist(reference, centers, p=2).cpu().numpy()
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    # Reorder centers according to col_ind
+    aligned = centers[col_ind]
+    return aligned
+
+def multi_run_kmeans(n_runs=50, device="cuda"):
+    # Use the first run as the reference
+    reference = run_pca_kmeans(device)
+    centers_list = [reference.cpu().numpy()]
+    
+    for i in range(1, n_runs):
+        centers = run_pca_kmeans(device)
+        # Align the current run's centers to the reference
+        aligned_centers = align_centers(reference, centers)
+        centers_list.append(aligned_centers.cpu().numpy())
+    
+    centers_array = np.stack(centers_list, axis=0)  # Shape: (n_runs, n_clusters, n_features)
+    return centers_array
+
+def compute_credible_intervals(n_runs=50, device="cuda"):
+    centers_array = multi_run_kmeans(n_runs, device)
+    
+    mean_centers = np.mean(centers_array, axis=0)
+    lower = np.percentile(centers_array, 2.5, axis=0)
+    upper = np.percentile(centers_array, 97.5, axis=0)
+    
+    return mean_centers, lower, upper
 
 if __name__ == "__main__":
     # Set device
@@ -185,22 +282,46 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         device="cuda"
 
-#    # Perform stochastic PCA
-#    n_components = 32
-#
-#    # Perform k-means clustering
-#    n_clusters = 1024  # Number of clusters
+    # res_gp = gp_minimize(objective, space, acq_func="EI", n_calls=50, n_jobs=10, random_state=42)
 
-    res_gp = gp_minimize(objective, space, n_calls=50, random_state=42)
+    n_batches = 10
+    batch_size = 5
 
-    # Print the results.
-    print("Best silhouette score: {:.4f}".format(None if res_gp is None else -res_gp.fun))
-    print("Best hyperparameters:")
-    print("  n_components:", None if res_gp is None else res_gp.x[0])
-    print("  k (clusters):", None if res_gp is None else res_gp.x[1])
-    print("  learning_rate:", None if res_gp is None else res_gp.x[2])
-    print("  n_epochs:", None if res_gp is None else res_gp.x[3])
-    print("  optimizer:", None if res_gp is None else res_gp.x[4])
+    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+
+    for i in range(n_batches):
+        candidates = opt.ask(n_points=batch_size)
+
+        if candidates is None:
+            raise ValueError("opt.ask() returned None")
+
+        scores = Parallel(n_jobs=batch_size)(
+            delayed(objective)(params) for params in candidates
+        )
+        
+        opt.tell(candidates, scores)
+        print(f"Batch {i+1}: Best score so far = {-min(opt.yi):.4f}")
+
+    # Best config
+    best_idx = np.argmin(opt.yi)
+    print("\nBest configuration:")
+    print(f"  Params: {opt.Xi[best_idx]}")
+    print(f"  Silhouette Score: {-opt.yi[best_idx]:.4f}")
+
+#    # Print the results.
+#    print("Best min distance: {:.4f}".format(None if res_gp is None else -res_gp.fun))
+#    print("Best hyperparameters:")
+#    print("  n_components:", None if res_gp is None else res_gp.x[0])
+#    print("  k (clusters):", None if res_gp is None else res_gp.x[1])
+#    print("  learning_rate:", None if res_gp is None else res_gp.x[2])
+#    print("  n_epochs:", None if res_gp is None else res_gp.x[3])
+#    print("  optimizer:", None if res_gp is None else res_gp.x[4])
+
+    # TODO: Implement credible intervals
+
+#    mean_centers, lower_bounds, upper_bounds = compute_credible_intervals(
+#        n_runs=50, device=device
+#    )
 
 #    # build a index-to-root_id dictionary
 #    from index_mapping import load_mapping
