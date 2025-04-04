@@ -5,6 +5,20 @@ import torch.optim as optim
 import numpy as np
 from scipy.sparse import load_npz
 from tqdm import tqdm
+from joblib import Parallel, delayed
+from sklearn.metrics import silhouette_score
+
+from skopt import Optimizer
+from skopt.space import Integer, Real, Categorical
+from skopt.utils import use_named_args
+
+space = [
+    Integer(24, 40, name='n_pca_components'),
+    Integer(256, 4096, prior='log-uniform', name='k'),
+    Real(1e-4, 1e-1, prior='log-uniform', name='learning_rate'),
+    Integer(5000, 15000, name='n_epochs'),
+    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')  # Optimizer choice
+]
 
 def stochastic_pca(W_csr, n_components, batch_size=128, lr=0.01, max_iter=1000, tol=1e-6, optimizer_choice="Adam",device="cuda"):
     """
@@ -155,45 +169,49 @@ class VariationalMixtureOfGaussians(nn.Module):
         log_likelihood = self.forward(x)
         return -log_likelihood.mean()
 
-#######################
-# 3. Putting It Together #
-#######################
+@use_named_args(space)
+def objective(**params):
+    #run = wdb.init(
+    #    project="flywrite",
+    #)
 
-if __name__ == "__main__":
-    # For reproducibility and device configuration
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(42)
+    n_pca_components = params["n_pca_components"]
+    n_mog_components = params["k"]
+    learning_rate = params["learning_rate"]
+    n_epochs = params["n_epochs"]
+    optimizer_choice = params["optimizer"]
 
-    # Generate synthetic data (or load your dataset)
-    # For example, 1000 samples, 50 features.
-    N, D = 1000, 50
-    X = torch.randn(N, D, device=device)
-
-    # --- Step 1: Run Stochastic PCA ---
-    n_pca_components = 10  # Reduce from 50 to 10 dimensions
-
+    # Load the sparse matrix
     file_path = "./sparse_connectivity_matrix.npz"
-
     adj_matrix = load_npz(file_path)
+    print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
 
     U, b = stochastic_pca(adj_matrix, 
                       n_pca_components, 
                       batch_size=512, 
-                      lr=0.01, 
-                      max_iter=100,
+                      lr=learning_rate, 
+                      max_iter=n_epochs,
                       tol=1e-6,
-                      optimizer_choice="Adam",
+                      optimizer_choice=optimizer_choice,
                       device=device)
-
+    
+    # Orthogonalize U to obtain principal components
     U_orth = orthogonalize(U).detach()
 
-    # --- Step 2: Train Variational Mixture of Gaussians on PCA output ---
-    n_mog_components = 3  # Number of clusters/components in the mixture
+    # cluster_centers, labels, min_distances = kmeans_clustering(U_orth, n_clusters, device=device)
     mog_model = VariationalMixtureOfGaussians(input_dim=n_pca_components, n_components=n_mog_components).to(device)
-    optimizer_mog = optim.Adam(mog_model.parameters(), lr=0.01)
+    
+    # Initialize Adam optimizer
+    optimizer_mog = optim.Adam(mog_model.parameters(), lr=learning_rate)
+    if optimizer_choice == 'Adam':
+        optimizer_mog = optim.Adam(mog_model.parameters(), lr=learning_rate)
+    elif optimizer_choice == 'SGD':
+        optimizer_mog = optim.SGD(mog_model.parameters(), lr=learning_rate)
+    elif optimizer_choice == 'AdamW':
+        optimizer_mog = optim.AdamW(mog_model.parameters(), lr=learning_rate)
 
-    n_epochs_mog = 200
-    for epoch in range(n_epochs_mog):
+    # should we introduce hyperparam for n_epoch_vmog?
+    for epoch in range(100):
         optimizer_mog.zero_grad()
         loss = mog_model.loss(U_orth)
         loss.backward()
@@ -213,7 +231,7 @@ if __name__ == "__main__":
 
         # Compute responsibilities for each sample in U_orth.
         # U_orth is assumed to have shape (N, d), where d == n_pca_components.
-        N, d = U_orth.shape
+        # N, d = U_orth.shape
         # Expand U_orth to (N, 1, d)
         U_expanded = U_orth.unsqueeze(1)  # shape: (N, 1, d)
         # Expand means and log_vars from mog_model:
@@ -239,29 +257,83 @@ if __name__ == "__main__":
         # Hard assignments: assign each sample to the component with highest responsibility
         labels = torch.argmax(resp, dim=1)  # shape: (N,)
 
-        # build a index-to-root_id dictionary
-        from index_mapping import load_mapping
+    print("Cluster labels shape:", labels.shape)
 
-        mapping = load_mapping('./root_id_to_index_mapping.json')
-        rootid_mapping = dict((v, k) for k, v in mapping.items())
+    # Compute the silhouette score.
+    score = silhouette_score(U_orth, labels)
+    
+    # Since gp_minimize minimizes the objective, return the negative silhouette score.
+    return -score
 
-        #  build a cluster assignment dictionary
-        cluster_assignment_dict = dict()
-        for i in range(len(labels)):
-            root_id = mapping[i]
-            cluster_assignment_dict[root_id] = labels[i].item()
+if __name__ == "__main__":
+    # Set device
+    device="cpu"
+    # if torch.backends.mps.is_available():
+    #     device="mps"
+    if torch.cuda.is_available():
+        device="cuda"
 
-        # Save the results
-        torch.save(U_orth.cpu(), 'U_orth.pt')
-        print("Saved U and U_orth to disk.")
+    # res_gp = gp_minimize(objective, space, acq_func="EI", n_calls=50, n_jobs=10, random_state=42)
 
-        # Save labels and model parameters as desired
-        torch.save(labels.cpu(), 'mog_labels.pt')
-        torch.save(learned_weights.detach().cpu(), 'mog_weights.pt')
-        torch.save(learned_means.detach().cpu(), 'mog_means.pt')
-        torch.save(learned_vars.detach().cpu(), 'mog_variances.pt')
+    n_batches = 10
+    batch_size = 5
+
+    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+
+    for i in range(n_batches):
+        candidates = opt.ask(n_points=batch_size)
+
+        if candidates is None:
+            raise ValueError("opt.ask() returned None")
+
+        scores = Parallel(n_jobs=batch_size)(
+            delayed(objective)(params) for params in candidates
+        )
         
-        # Optionally, also save the responsibilities if needed
-        torch.save(resp.cpu(), 'mog_responsibilities.pt')
+        opt.tell(candidates, scores)
+        print(f"Batch {i+1}: Best score so far = {-min(opt.yi):.4f}")
 
-        np.save("mog_cluster_assignment_dict.npy", cluster_assignment_dict, allow_pickle=True)
+    # Best config
+    best_idx = np.argmin(opt.yi)
+    print("\nBest configuration:")
+    print(f"  Params: {opt.Xi[best_idx]}")
+    print(f"  Silhouette Score: {-opt.yi[best_idx]:.4f}")
+
+    # For reproducibility and device configuration
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(42)
+
+#    # Generate synthetic data (or load your dataset)
+#    # For example, 1000 samples, 50 features.
+#    N, D = 1000, 50
+#    X = torch.randn(N, D, device=device)
+
+
+        #TODO: Implement credible intervals
+
+#        # build a index-to-root_id dictionary
+#        from index_mapping import load_mapping
+#
+#        mapping = load_mapping('./root_id_to_index_mapping.json')
+#        rootid_mapping = dict((v, k) for k, v in mapping.items())
+#
+#        #  build a cluster assignment dictionary
+#        cluster_assignment_dict = dict()
+#        for i in range(len(labels)):
+#            root_id = mapping[i]
+#            cluster_assignment_dict[root_id] = labels[i].item()
+#
+#        # Save the results
+#        torch.save(U_orth.cpu(), 'U_orth.pt')
+#        print("Saved U and U_orth to disk.")
+#
+#        # Save labels and model parameters as desired
+#        torch.save(labels.cpu(), 'mog_labels.pt')
+#        torch.save(learned_weights.detach().cpu(), 'mog_weights.pt')
+#        torch.save(learned_means.detach().cpu(), 'mog_means.pt')
+#        torch.save(learned_vars.detach().cpu(), 'mog_variances.pt')
+#        
+#        # Optionally, also save the responsibilities if needed
+#        torch.save(resp.cpu(), 'mog_responsibilities.pt')
+#
+#        np.save("mog_cluster_assignment_dict.npy", cluster_assignment_dict, allow_pickle=True)

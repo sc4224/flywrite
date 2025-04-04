@@ -8,56 +8,23 @@ import wandb as wdb
 
 from datetime import datetime
 
+from joblib import Parallel, delayed
+
+from skopt import Optimizer, gp_minimize
+from skopt.space import Integer, Real, Categorical
+from skopt.utils import use_named_args
+
+space = [
+    Integer(24, 40, name='n_components'),
+    Integer(256, 4096, prior='log-uniform', name='k'),
+    Real(1e-4, 1e-1, prior='log-uniform', name='learning_rate'),
+    Integer(100, 1000, name='n_epochs'),
+    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')  # Optimizer choice
+]
+
 run = wdb.init(
     project="flywrite",
 )
-
-device="cpu"
-if torch.backends.mps.is_available():
-    device="mps"
-if torch.cuda.is_available():
-    device="cuda"
-
-# set the global seed using torch. use the current time to make it more random.
-torch.manual_seed(int(datetime.now().timestamp()))
-
-# Constants
-K = 1024      # Number of clusters: 729
-d = 32       # Dimensionality of feature space
-minibatch_size = 2_500
-num_m_updates = 10_000
-n_epochs = 1_000
-
-dtype=torch.float32
-if device == "cuda":
-    dtype=torch.bfloat16
-
-logK = torch.log(torch.tensor(K, dtype=dtype))
-
-# Load the sparse matrix from `sparse_connectivity_matrix.npz`.
-# The sparse matrix is in the format of csr_matrix.
-adj_matrix = load_npz("./sparse_connectivity_matrix.npz")
-
-# Threshold the sparse matrix to obtain a binary adjacency matrix
-adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
-
-N = adj_matrix.shape[0]  # Number of nodes
-print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
-
-# prepare the incoming and outgoing edge stats
-outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).to(device).squeeze() / N
-outgoing_sum_mean = outgoing_sum.mean()
-incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).to(device).squeeze() / N
-incoming_sum_mean = incoming_sum.mean()
-
-# Model parameters
-U_left = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
-U_right = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
-bias = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device)))
-
-tr = torch.randn(N, K, dtype=dtype)
-# approximate posterior: must be sampled from a Dirichlet distribution
-q_logits = nn.Parameter(1/K * tr.to(device))
 
 # breakpoint()
 
@@ -76,11 +43,26 @@ def cosine(x, y):
     return torch.mm(x, y.t()) / (torch.norm(x, dim=-1) * torch.norm(y, dim=-1))
 
 # M-step: Update U_left and U_right
-def m_step(n_max_updates=None, optimizer=None):
+def m_step(N=None,
+           n_max_updates=None,
+           optimizer=None,
+           minibatch_size=2500,
+           lr=0.01,
+           q_logits=None,
+           U_left=None,
+           U_right=None,
+           bias=None,
+           adj_matrix=None,
+           dtype=torch.float32):
+    if q_logits is None or U_left is None or U_right is None or bias is None or adj_matrix is None:
+        return
+    if N is None:
+        N = 1
     if n_max_updates is None:
         n_max_updates = 1
+
     if optimizer is None:
-        optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=0.001)
+        optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=lr)
 
     initial_loss = 0.
     final_loss = 0.
@@ -163,9 +145,123 @@ def m_step(n_max_updates=None, optimizer=None):
     
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
 
+@use_named_args(space)
+def objective(**params):
+    n_components = params["n_components"]
+    K = params["k"]
+    lr = params["learning_rate"]
+    n_epochs = params["n_epochs"]
+    optimizer_choice = params["optimizer"]
 
-# EM algorithm
-optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=1e-2)
+    device="cpu"
+    if torch.backends.mps.is_available():
+        device="mps"
+    if torch.cuda.is_available():
+        device="cuda"
+
+    # set the global seed using torch. use the current time to make it more random.
+    torch.manual_seed(int(datetime.now().timestamp()))
+
+    # Constants
+    d = 32       # Dimensionality of feature space
+    # is this a hyperparameter?
+    minibatch_size = 2_500
+    num_m_updates = 10_000
+
+    dtype=torch.float32
+    if device == "cuda":
+        dtype=torch.bfloat16
+
+    # logK = torch.log(torch.tensor(K, dtype=dtype))
+
+    # Load the sparse matrix from `sparse_connectivity_matrix.npz`.
+    # The sparse matrix is in the format of csr_matrix.
+    adj_matrix = load_npz("./sparse_connectivity_matrix.npz")
+
+    # Threshold the sparse matrix to obtain a binary adjacency matrix
+    adj_matrix.data = (adj_matrix.data > 0).astype(np.int8)
+
+    N = adj_matrix.shape[0]  # Number of nodes
+    print(f"Loaded adjacency matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+
+    # prepare the incoming and outgoing edge stats
+    outgoing_sum = torch.tensor(adj_matrix.sum(axis=1), dtype=dtype).to(device).squeeze() / N
+    # outgoing_sum_mean = outgoing_sum.mean()
+    incoming_sum = torch.tensor(adj_matrix.sum(axis=0), dtype=dtype).to(device).squeeze() / N
+    # incoming_sum_mean = incoming_sum.mean()
+
+    # Model parameters
+    U_left = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
+    U_right = nn.Parameter(1/np.sqrt(K * d) * torch.randn(K, d, dtype=dtype).to(device))
+    bias = nn.Parameter(torch.log(torch.tensor([adj_matrix.mean()], dtype=dtype).to(device)))
+
+    tr = torch.randn(N, K, dtype=dtype)
+    # approximate posterior: must be sampled from a Dirichlet distribution
+    q_logits = nn.Parameter(1/K * tr.to(device))
+
+    # EM algorithm
+    # optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=1e-2)
+
+    optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=lr)
+
+    if optimizer_choice == 'Adam':
+        optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=lr)
+    elif optimizer_choice == 'SGD':
+        optimizer = torch.optim.SGD([U_left, U_right, bias, q_logits], lr=lr)
+    elif optimizer_choice == 'AdamW':
+        optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=lr)
+
+    try:
+        for epoch in range(n_epochs):
+            print(f"Epoch {epoch}")
+            # M-step: Update U_left and U_right
+            m_step(N=N, n_max_updates=num_m_updates, optimizer=optimizer, minibatch_size=minibatch_size, lr=lr, q_logits=q_logits, U_left=U_left, U_right=U_right, bias=bias, adj_matrix=adj_matrix, dtype=dtype)
+            print("Cluster assignments:")
+            for i in range(10):
+                print(f"Node {i}: Cluster {torch.argmax(q_logits[i]).item()}")
+
+    except KeyboardInterrupt:
+        print("Training interrupted.")
+
+    # what do we return here?
+
+
+if __name__ == "__main__":
+    # Set device
+    device="cpu"
+    # if torch.backends.mps.is_available():
+    #     device="mps"
+    if torch.cuda.is_available():
+        device="cuda"
+
+    # res_gp = gp_minimize(objective, space, acq_func="EI", n_calls=50, n_jobs=10, random_state=42)
+
+    n_batches = 10
+    batch_size = 5
+
+    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+
+    for i in range(n_batches):
+        candidates = opt.ask(n_points=batch_size)
+
+        if candidates is None:
+            raise ValueError("opt.ask() returned None")
+
+        scores = Parallel(n_jobs=batch_size)(
+            delayed(objective)(params) for params in candidates
+        )
+        
+        opt.tell(candidates, scores)
+        print(f"Batch {i+1}: Best score so far = {-min(opt.yi):.4f}")
+
+    # Best config
+    # do we use silhouette score here? we technically do have labels
+    best_idx = np.argmin(opt.yi)
+    print("\nBest configuration:")
+    print(f"  Params: {opt.Xi[best_idx]}")
+    print(f"  Silhouette Score: {-opt.yi[best_idx]:.4f}")
+
+
 
 def get_lr(optimizer):
     result = []
@@ -173,43 +269,35 @@ def get_lr(optimizer):
         result.append(param_group['lr'])
     return sum(result) / len(result)
 
-try:
-    for epoch in range(n_epochs):
-        print(f"Epoch {epoch}")
-        # M-step: Update U_left and U_right
-        m_step(n_max_updates=num_m_updates, optimizer=optimizer)
-        print("Cluster assignments:")
-        for i in range(10):
-            print(f"Node {i}: Cluster {torch.argmax(q_logits[i]).item()}")
 
-except KeyboardInterrupt:
-    print("Training interrupted.")
 
-# Save results
-cluster_assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()  # Inferred cluster for each node
-cluster_scores = torch.max(q_logits, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
-U_left_final = U_left.detach().cpu().numpy()
-U_right_final = U_right.detach().cpu().numpy()
+## Save results
+#cluster_assignments = torch.argmax(q_logits, dim=-1).cpu().numpy()  # Inferred cluster for each node
+#cluster_scores = torch.max(q_logits, dim=-1).values.cpu().detach().numpy()  # Confidence scores for each cluster
+#U_left_final = U_left.detach().cpu().numpy()
+#U_right_final = U_right.detach().cpu().numpy()
 
-# build a index-to-root_id dictionary
-from index_mapping import load_mapping, matrix_index_to_root_id
+#TODO: Implement credible intervals
 
-mapping = load_mapping('./root_id_to_index_mapping.json')
-rootid_mapping = dict((v, k) for k, v in mapping.items())
-
-# build a cluster assignment dictionary
-cluster_assignment_dict = dict()
-for i in range(len(cluster_assignments)):
-    root_id = mapping[i]
-    cluster_assignment_dict[root_id] = cluster_assignments[i].item()
-
-np.save("cluster_assignments.npy", cluster_assignments)
-np.save("cluster_scores.npy", cluster_scores)
-np.save("U_left.npy", U_left_final)
-np.save("U_right.npy", U_right_final)
-np.save("cluster_assignment_dict.npy", cluster_assignment_dict)
-
-print("Results saved: 'cluster_assignments.npy', 'U_left.npy', 'U_right.npy', 'cluster_assignment_dict.npy'")
-# custom save and load function for weights and biases
-# put in folder, iteration i
-# validation set, overfit risk
+## build a index-to-root_id dictionary
+#from index_mapping import load_mapping, matrix_index_to_root_id
+#
+#mapping = load_mapping('./root_id_to_index_mapping.json')
+#rootid_mapping = dict((v, k) for k, v in mapping.items())
+#
+## build a cluster assignment dictionary
+#cluster_assignment_dict = dict()
+#for i in range(len(cluster_assignments)):
+#    root_id = mapping[i]
+#    cluster_assignment_dict[root_id] = cluster_assignments[i].item()
+#
+#np.save("cluster_assignments.npy", cluster_assignments)
+#np.save("cluster_scores.npy", cluster_scores)
+#np.save("U_left.npy", U_left_final)
+#np.save("U_right.npy", U_right_final)
+#np.save("cluster_assignment_dict.npy", cluster_assignment_dict)
+#
+#print("Results saved: 'cluster_assignments.npy', 'U_left.npy', 'U_right.npy', 'cluster_assignment_dict.npy'")
+## custom save and load function for weights and biases
+## put in folder, iteration i
+## validation set, overfit risk
