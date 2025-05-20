@@ -4,6 +4,7 @@ matplotlib
 scikit-learn
 seaborn
 torch
+pytorch-ignite
 tqdm
 wandb
 scikit-optimize
