@@ -13,6 +13,8 @@ from skopt import Optimizer
 from skopt.space import Integer, Real, Categorical
 from skopt.utils import use_named_args
 
+import wandb, os
+
 space = [
     Integer(256, 1024, prior='log-uniform', name='k'),
     Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
@@ -35,15 +37,6 @@ def cosine(x, y):
     return torch.mm(x, y.t()) / (torch.norm(x, dim=-1) * torch.norm(y, dim=-1))
 
 def train_val_split(adj_matrix, val_frac=0.2, seed=42):
-    """
-    Randomly split nodes into training and validation sets.
-
-    Returns:
-      train_idx: 1D array of training node indices
-      val_idx:   1D array of validation node indices
-      train_adj: csr_matrix of adj_matrix[train_idx][:, train_idx]
-      val_adj:   csr_matrix of adj_matrix[val_idx][:, val_idx]
-    """
     N = adj_matrix.shape[0]
     np.random.seed(seed)
     perm = np.random.permutation(N)
@@ -54,38 +47,143 @@ def train_val_split(adj_matrix, val_frac=0.2, seed=42):
     val_adj = adj_matrix[val_idx][:, val_idx]
     return train_idx, val_idx, train_adj, val_adj
 
+def e_step_val(q_logits,
+               val_idx,
+               U_left,
+               U_right,
+               bias,
+               val_adj,
+               dtype=torch.float32,
+               device="cpu",
+               lr=1e-2,
+               n_iters=10):
+    """
+    Optimize only q_logits[val_idx] to maximize ELBO on val_adj,
+    holding U_left, U_right, bias fixed.
+    """
+    # 1) extract and make it a Parameter
+    q_val = nn.Parameter(q_logits[val_idx].clone().to(device))
+    opt   = torch.optim.Adam([q_val], lr=lr)
+
+    for _ in range(n_iters):
+        q_prob = torch.softmax(q_val, dim=-1)   # (n_val × K)
+
+        # build sparse A for val_adj (same as before)
+        coo = val_adj.tocoo()
+        idx = torch.stack([
+            torch.from_numpy(coo.row).long(),
+            torch.from_numpy(coo.col).long()
+        ], dim=0).to(device)
+        vals = torch.from_numpy(coo.data).to(dtype).to(device)
+        A    = torch.sparse_coo_tensor(idx, vals, (len(val_idx), len(val_idx)), device=device)
+
+        # compute edge/non-edge terms
+        Aq      = torch.sparse.mm(A, q_prob)           # (n_val × K)
+        edge_KK = q_prob.t() @ Aq                      # (K × K)
+        s       = q_prob.sum(0)                        # (K,)
+        all_KK  = s.unsqueeze(1) * s.unsqueeze(0)
+        non_KK  = all_KK - edge_KK
+
+        e_prob  = sigmoid(dot(U_left, U_right) + bias) # (K × K)
+        obj     = (edge_KK * log_(e_prob)).sum() \
+                + (non_KK   * log_(1-e_prob)).sum() \
+                - (q_prob * log_(q_prob)).sum(1).mean()
+
+        # gradient ascent on ELBO
+        loss = -obj
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    # 3) write back the inferred q_val
+    with torch.no_grad():
+        q_logits[val_idx] = q_val.data.cpu()
 
 def compute_val_lowerbound(val_idx,
-                           q_logits,
-                           U_left,
-                           U_right,
-                           bias,
-                           adj_matrix,
-                           dtype=torch.float32,
-                           device="cpu"):
+                          q_logits,
+                          U_left,
+                          U_right,
+                          bias,
+                          val_adj,
+                          dtype=torch.float32,
+                          device="cpu"):
     """
-    Compute the ELBO (variational lower bound) on the held-out validation nodes.
-    Mirrors the math in m_step but with torch.no_grad() and no parameter updates.
+    Sparse‐only ELBO on held‐out nodes.
     """
+    device = q_logits.device
     with torch.no_grad():
-        q_probs = torch.softmax(q_logits[val_idx], dim=-1)  # (n_val x K)
-        
-        CC = torch.tensor(
-            adj_matrix[val_idx][:, val_idx].toarray(),
-            dtype=dtype
-        ).to(device)                                 # (n_val x n_val)
+        # 1) posteriors on val nodes
+        q = torch.softmax(q_logits[val_idx], dim=-1)  # (n_val × K)
+        n_val, _ = q.shape
 
-        edge_weighted_KK = torch.mm(q_probs.t(), torch.mm(CC, q_probs))       # (K x K)
-        non_edge_weighted_KK = torch.mm(q_probs.t(), torch.mm((1-CC), q_probs)) # (K x K)
+        # 2) convert SciPy CSR to PyTorch sparse_coo_tensor (one‐time)
+        coo = val_adj.tocoo()
+        idx = torch.stack([
+            torch.from_numpy(coo.row).long(),
+            torch.from_numpy(coo.col).long()
+        ], dim=0).to(device)                            # (2 × E)
+        vals = torch.from_numpy(coo.data).to(dtype).to(device)  # (E,)
 
-        e_prob = sigmoid(dot(U_left, U_right) + bias) # (K x K)
+        CC = torch.sparse_coo_tensor(idx, vals, (n_val, n_val), device=device)
 
-        obj = (edge_weighted_KK * log_(e_prob)).sum() + (non_edge_weighted_KK * log_(1 - e_prob)).sum()
-        obj = obj - (q_probs * log_(q_probs)).sum(1).mean()
+        # 3) sparse‐dense multiply (n_val × K)
+        # 4) accumulate K×K edge‐weight matrix
+        edge_KK = q.t() @ torch.sparse.mm(CC, q)             # (K × K)
 
-        # compute the loss
+        # 5) non‐edge mass via total mass minus edges
+        s = q.sum(dim=0)                   # (K,)
+        all_pairs = s.unsqueeze(1) * s.unsqueeze(0) # (K × K)
+        non_edge_KK = all_pairs - edge_KK
+
+        # 6) compute ELBO exactly as before
+        e_prob = sigmoid(dot(U_left, U_right) + bias)  # (K × K)
+        edge_term = (edge_KK * log_(e_prob)).sum()
+        non_term = (non_edge_KK * log_(1-e_prob)).sum()
+        entropy = (q * log_(q)).sum(1).mean()
+        obj = edge_term + non_term - entropy
+
+        #avg_obj = obj / (n_val * n_val)
+        #loss = -avg_obj
         loss = -obj
-        return loss.item()
+
+    # cleanup
+    del CC, edge_KK, non_edge_KK, all_pairs, s, e_prob, edge_term, non_term, entropy, obj, q
+    gc.collect()
+
+    return loss.item()
+
+#def compute_val_lowerbound(val_idx,
+#                           q_logits,
+#                           U_left,
+#                           U_right,
+#                           bias,
+#                           adj_matrix,
+#                           dtype=torch.float32,
+#                           device="cpu"):
+#    """
+#    Compute the ELBO (variational lower bound) on the held-out validation nodes.
+#    Mirrors the math in m_step but with torch.no_grad() and no parameter updates.
+#    """
+#    with torch.no_grad():
+#        q_probs = torch.softmax(q_logits[val_idx], dim=-1)  # (n_val x K)
+#        n_val   = len(val_idx)
+#        
+#        CC = torch.from_numpy(adj_matrix.toarray()).to(dtype=dtype, device=device)                                 # (n_val x n_val)
+#
+#        edge_weighted_KK = torch.mm(q_probs.t(), torch.mm(CC, q_probs))       # (K x K)
+#        non_edge_weighted_KK = torch.mm(q_probs.t(), torch.mm((1-CC), q_probs)) # (K x K)
+#
+#        e_prob = sigmoid(dot(U_left, U_right) + bias) # (K x K)
+#
+#        obj = (edge_weighted_KK * log_(e_prob)).sum() + (non_edge_weighted_KK * log_(1 - e_prob)).sum()
+#        obj = obj - (q_probs * log_(q_probs)).sum(1).mean()
+#
+#        # compute the loss
+#        avg_obj  = obj / (n_val * n_val)
+#        loss = -avg_obj
+#
+#        del q_probs, CC, edge_weighted_KK, non_edge_weighted_KK, e_prob, obj, avg_obj
+#        gc.collect()
+#
+#        return loss.item()
 
 # M-step: Update U_left and U_right
 def m_step(N=None,
@@ -98,7 +196,8 @@ def m_step(N=None,
            U_right=None,
            bias=None,
            adj_matrix=None,
-           dtype=torch.float32):
+           dtype=torch.float32,
+           device="cpu"):
     if q_logits is None or U_left is None or U_right is None or bias is None or adj_matrix is None:
         return
     if N is None:
@@ -167,24 +266,32 @@ def m_step(N=None,
 
         # Perform a gradient step
         optimizer.step()
+        del CC, e_prob, edge_weighted_KK, non_edge_weighted_KK, q_probs_batch_i, q_probs_batch_j, minibatch_indices_i, minibatch_indices_j
+        gc.collect()
 
+    # compute the loss
+    #initial_loss = initial_loss / (minibatch_size * minibatch_size)
+    #final_loss  = final_loss / (minibatch_size * minibatch_size)
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
-    del U_left, U_right, bias, q_logits, optimizer, N, adj_matrix, dtype, minibatch_size, lr, initial_loss, indices_i, indices_j, n_minibatches, n_max_updates
+    del U_left, U_right, bias, q_logits, optimizer, N, adj_matrix, dtype, minibatch_size, lr, indices_i, indices_j, n_minibatches, n_max_updates
     gc.collect()
-    return final_loss
+    return initial_loss, final_loss
 
 @use_named_args(space)
 def objective(**params):
+    run = wandb.init(
+        project="flywrite1",
+        resume="allow",
+        reinit=True,           # allow multiple inits in the same process
+        settings=wandb.Settings(start_method="thread")
+    )
+
     K = params["k"]
     lr = params["learning_rate"]
-    n_epochs = 10 #params["n_epochs"]
+    n_epochs = params["n_epochs"]
     optimizer_choice = params["optimizer"]
     
     device = "cpu"
-    if torch.backends.mps.is_available():
-        device = "mps"
-    if torch.cuda.is_available():
-        device = "cuda"
 
     # Set the global seed using torch
     torch.manual_seed(int(datetime.now().timestamp()))
@@ -219,16 +326,20 @@ def objective(**params):
         optimizer = torch.optim.Adam([U_left, U_right, bias, q_logits], lr=lr)
     elif optimizer_choice == 'SGD':
         optimizer = torch.optim.SGD([U_left, U_right, bias, q_logits], lr=lr)
-    else:  # Default to AdamW
+    else:
         optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=lr)
 
+    val_elbo = 0
+
+    del adj_matrix
+    gc.collect()
 
     # --- TRAINING LOOP ---
     try:
         for epoch in range(n_epochs):
             print(f"\nEpoch {epoch+1}/{n_epochs}")
             # only train on the training subgraph
-            _ = m_step(
+            initial_loss, final_loss = m_step(
                 N=N_train,
                 optimizer=optimizer,
                 minibatch_size=minibatch_size,
@@ -237,49 +348,50 @@ def objective(**params):
                 U_left=U_left,
                 U_right=U_right,
                 bias=bias,
-                adj_matrix=train_adj,  # ← train‐only adjacency
+                adj_matrix=train_adj,
                 dtype=dtype,
                 n_max_updates=num_m_updates
             )
 
+            # --- VALIDATION STEP (OUTSIDE OF TRAINING LOOP) ---
+            print("\n--- Validation Step ---")
+            e_step_val(q_logits, val_idx, U_left, U_right, bias, val_adj, device=device)
+
+            val_elbo = compute_val_lowerbound(
+                val_idx=val_idx,
+                q_logits=q_logits,
+                U_left=U_left,
+                U_right=U_right,
+                bias=bias,
+                val_adj=val_adj,
+                dtype=dtype,
+                device=device
+            )
+            print(f"Current Validation ELBO: {val_elbo}")
+            run.log({
+                "initial_train_elbo": initial_loss,
+                "final_train_elbo": final_loss,
+                "val_elbo": val_elbo,
+            }, commit=True)
+
     except KeyboardInterrupt:
         print("Training interrupted.")
-
-    # --- VALIDATION STEP (OUTSIDE OF TRAINING LOOP) ---
-    print("\n--- Validation Step ---")
-    val_elbo = compute_val_lowerbound(
-        val_idx=val_idx,
-        q_logits=q_logits,
-        U_left=U_left,
-        U_right=U_right,
-        bias=bias,
-        adj_matrix=adj_matrix,  # still need full adj to slice inside
-        dtype=dtype,
-        device=device
-    )
     
-    print(f"Final Validation ELBO: {val_elbo:.4f}")
+    print(f"Final Validation ELBO: {val_elbo}")
     
     # Clean up to avoid memory issues
-    del optimizer, adj_matrix, dtype, num_m_updates, minibatch_size, d
+    del optimizer, dtype, num_m_updates, minibatch_size, d
     gc.collect()
-    if device == "mps":
-        torch.mps.empty_cache()
-    elif device == "cuda":
-        torch.cuda.empty_cache()
+    run.finish()
 
     return -val_elbo  # Return negative ELBO for minimization
 
 if __name__ == "__main__":
     # Set device
     device = "cpu"
-    if torch.backends.mps.is_available():
-        device = "mps"
-    if torch.cuda.is_available():
-        device = "cuda"
 
-    n_batches = 1
-    batch_size = 4
+    n_batches = 10
+    batch_size = 5
 
     opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
 
@@ -294,10 +406,12 @@ if __name__ == "__main__":
         )
         
         opt.tell(candidates, scores)
-        print(f"Batch {i+1}: Best score so far = {-min(opt.yi):.4f}")
+        print(f"All configurations: {opt.Xi}")
+        print(f"All scores: {opt.yi}")
+        print(f"Batch {i+1}: Best score so far = {-min(opt.yi)}")
 
     # Best config
     best_idx = np.argmin(opt.yi)
     print("\nBest configuration:")
     print(f"  Params: {opt.Xi[best_idx]}")
-    print(f"  Validation ELBO: {-opt.yi[best_idx]:.4f}")
+    print(f"  Validation ELBO: {-opt.yi[best_idx]}")
