@@ -13,7 +13,7 @@ from skopt import Optimizer
 from skopt.space import Integer, Real, Categorical
 from skopt.utils import use_named_args
 
-import wandb, os
+import wandb
 
 space = [
     Integer(256, 1024, prior='log-uniform', name='k'),
@@ -149,41 +149,6 @@ def compute_val_lowerbound(val_idx,
     gc.collect()
 
     return loss.item()
-
-#def compute_val_lowerbound(val_idx,
-#                           q_logits,
-#                           U_left,
-#                           U_right,
-#                           bias,
-#                           adj_matrix,
-#                           dtype=torch.float32,
-#                           device="cpu"):
-#    """
-#    Compute the ELBO (variational lower bound) on the held-out validation nodes.
-#    Mirrors the math in m_step but with torch.no_grad() and no parameter updates.
-#    """
-#    with torch.no_grad():
-#        q_probs = torch.softmax(q_logits[val_idx], dim=-1)  # (n_val x K)
-#        n_val   = len(val_idx)
-#        
-#        CC = torch.from_numpy(adj_matrix.toarray()).to(dtype=dtype, device=device)                                 # (n_val x n_val)
-#
-#        edge_weighted_KK = torch.mm(q_probs.t(), torch.mm(CC, q_probs))       # (K x K)
-#        non_edge_weighted_KK = torch.mm(q_probs.t(), torch.mm((1-CC), q_probs)) # (K x K)
-#
-#        e_prob = sigmoid(dot(U_left, U_right) + bias) # (K x K)
-#
-#        obj = (edge_weighted_KK * log_(e_prob)).sum() + (non_edge_weighted_KK * log_(1 - e_prob)).sum()
-#        obj = obj - (q_probs * log_(q_probs)).sum(1).mean()
-#
-#        # compute the loss
-#        avg_obj  = obj / (n_val * n_val)
-#        loss = -avg_obj
-#
-#        del q_probs, CC, edge_weighted_KK, non_edge_weighted_KK, e_prob, obj, avg_obj
-#        gc.collect()
-#
-#        return loss.item()
 
 # M-step: Update U_left and U_right
 def m_step(N=None,
