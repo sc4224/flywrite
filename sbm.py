@@ -16,10 +16,10 @@ from skopt.utils import use_named_args
 import wandb
 
 space = [
-    Integer(256, 1024, prior='log-uniform', name='k'),
+    Integer(256, 2048, prior='log-uniform', name='k'),
+    Integer(16, 48, name='d'),
     Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
-    Integer(100, 1000, name='n_epochs'),
-    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')  # Optimizer choice
+    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')
 ]
 
 def sigmoid(x, clamp=False):
@@ -252,8 +252,9 @@ def objective(**params):
     )
 
     K = params["k"]
+    d = params["d"]
     lr = params["learning_rate"]
-    n_epochs = params["n_epochs"]
+    n_epochs = 5
     optimizer_choice = params["optimizer"]
     
     device = "cpu"
@@ -262,8 +263,7 @@ def objective(**params):
     torch.manual_seed(int(datetime.now().timestamp()))
 
     # Constants
-    d = 32       # Dimensionality of feature space
-    minibatch_size = 2_500
+    minibatch_size = 10_000
     num_m_updates = 10_000  # Reduced for hyperparameter search
 
     dtype = torch.float32
@@ -294,7 +294,8 @@ def objective(**params):
     else:
         optimizer = torch.optim.AdamW([U_left, U_right, bias, q_logits], lr=lr)
 
-    val_elbo = 0
+    lowest_elbo = float('inf')
+    best_epoch = 0
 
     del adj_matrix
     gc.collect()
@@ -333,6 +334,11 @@ def objective(**params):
                 device=device
             )
             print(f"Current Validation ELBO: {val_elbo}")
+
+            if val_elbo < lowest_elbo:
+                lowest_elbo = val_elbo
+                best_epoch = epoch
+
             run.log({
                 "initial_train_elbo": initial_loss,
                 "final_train_elbo": final_loss,
@@ -342,21 +348,22 @@ def objective(**params):
     except KeyboardInterrupt:
         print("Training interrupted.")
     
-    print(f"Final Validation ELBO: {val_elbo}")
+    print(f"Best Epoch: {best_epoch}")
+    print(f"Best Validation ELBO: {lowest_elbo}")
     
     # Clean up to avoid memory issues
     del optimizer, dtype, num_m_updates, minibatch_size, d
     gc.collect()
     run.finish()
 
-    return -val_elbo  # Return negative ELBO for minimization
+    return lowest_elbo, best_epoch
 
 if __name__ == "__main__":
     # Set device
     device = "cpu"
 
-    n_batches = 10
-    batch_size = 5
+    n_batches = 2
+    batch_size = 25
 
     opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
 
@@ -369,14 +376,18 @@ if __name__ == "__main__":
         scores = Parallel(n_jobs=batch_size)(
             delayed(objective)(params) for params in candidates
         )
+
+        lowest_elbos, best_epochs = zip(*scores)
         
-        opt.tell(candidates, scores)
+        opt.tell(candidates, lowest_elbos)
         print(f"All configurations: {opt.Xi}")
+        print(f"Best Epochs: {best_epochs}")
         print(f"All scores: {opt.yi}")
-        print(f"Batch {i+1}: Best score so far = {-min(opt.yi)}")
+        print(f"Batch {i+1}: Best score so far = {min(opt.yi)}")
 
     # Best config
     best_idx = np.argmin(opt.yi)
     print("\nBest configuration:")
     print(f"  Params: {opt.Xi[best_idx]}")
-    print(f"  Validation ELBO: {-opt.yi[best_idx]}")
+    print(f"  Best Epoch: {best_epochs[best_idx]}")
+    print(f"  Best Validation ELBO: {opt.yi[best_idx]}")
