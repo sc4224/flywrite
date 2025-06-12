@@ -28,6 +28,16 @@ def load_results(ids):
             scores.append((result["elbo"], result["best_epoch"]))
     return scores
 
+def sanitize_json(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    else:
+        return obj
+
 if __name__ == "__main__":
     opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
 
@@ -40,7 +50,8 @@ if __name__ == "__main__":
 
         for i, params in enumerate(candidates):
             with open(f"configs/params_{i}.json", "w") as f:
-                json.dump(params, f)
+                json.dump({k: sanitize_json(v) for k, v in params.items()}, f)
+                #json.dump(params, f)
 
         # Submit SLURM array job
         os.system(f"sbatch --array=0-{batch_size-1} run_sbm.sh")
