@@ -4,13 +4,18 @@ import time
 import numpy as np
 from skopt import Optimizer
 from skopt.space import Integer, Real, Categorical
+from skopt.utils import point_asdict
 
-space = [
+space_list = [
     Integer(256, 2048, prior='log-uniform', name='k'),
     Integer(16, 48, name='d'),
     Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
     Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')
 ]
+
+# Convert to dictionary for point_asdict
+space_dict = {dim.name: dim for dim in space_list}
+
 batch_size = 50
 n_batches = 1
 
@@ -39,7 +44,7 @@ def sanitize_json(obj):
         return obj
 
 if __name__ == "__main__":
-    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+    opt = Optimizer(dimensions=space_list, base_estimator="GP", acq_func="EI", random_state=42)
 
     for batch_idx in range(n_batches):
         candidates = opt.ask(n_points=batch_size)
@@ -49,9 +54,11 @@ if __name__ == "__main__":
         os.makedirs("results", exist_ok=True)
 
         for i, params in enumerate(candidates):
+            params_dict = point_asdict(space_dict, params)
+            # Sanitize numpy types for JSON serialization
+            sanitized_params = {k: sanitize_json(v) for k, v in params_dict.items()}
             with open(f"configs/params_{i}.json", "w") as f:
-                json.dump({k: sanitize_json(v) for k, v in params.items()}, f)
-                #json.dump(params, f)
+                json.dump(sanitized_params, f)
 
         # Submit SLURM array job
         os.system(f"sbatch --array=0-{batch_size-1} run_sbm.sh")
