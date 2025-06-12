@@ -7,8 +7,7 @@
 #SBATCH --array=0-49
 #SBATCH --cpus-per-task=1
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate sbmenv
+source ./sbmenv/bin/activate
 
 python sbm.py $SLURM_ARRAY_TASK_ID
 
