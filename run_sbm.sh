@@ -6,6 +6,7 @@
 #SBATCH --time=05:00:00
 #SBATCH --array=0-49
 #SBATCH --cpus-per-task=1
+#SBATCH --partition=standard
 
 source ./sbmenv/bin/activate
 
