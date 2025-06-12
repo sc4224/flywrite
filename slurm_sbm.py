@@ -1,0 +1,63 @@
+import json
+import os
+import time
+import numpy as np
+from skopt import Optimizer
+from skopt.space import Integer, Real, Categorical
+
+space = [
+    Integer(256, 2048, prior='log-uniform', name='k'),
+    Integer(16, 48, name='d'),
+    Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
+    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')
+]
+batch_size = 50
+n_batches = 1
+
+def wait_for_results(ids):
+    while True:
+        if all(os.path.exists(f"results/result_{i}.json") for i in ids):
+            break
+        time.sleep(10)
+
+def load_results(ids):
+    scores = []
+    for i in ids:
+        with open(f"results/result_{i}.json") as f:
+            result = json.load(f)
+            scores.append((result["elbo"], result["best_epoch"]))
+    return scores
+
+if __name__ == "__main__":
+    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+
+    for batch_idx in range(n_batches):
+        candidates = opt.ask(n_points=batch_size)
+
+        # Save candidates
+        os.makedirs("configs", exist_ok=True)
+        os.makedirs("results", exist_ok=True)
+
+        for i, params in enumerate(candidates):
+            with open(f"configs/params_{i}.json", "w") as f:
+                json.dump(params, f)
+
+        # Submit SLURM array job
+        os.system(f"sbatch --array=0-{batch_size-1} run_sbm.sh")
+
+        # Wait for results
+        wait_for_results(range(batch_size))
+
+        # Collect and use results
+        scores = load_results(range(batch_size))
+        lowest_elbos, best_epochs = zip(*scores)
+
+        opt.tell(candidates, lowest_elbos)
+        print(f"Batch {batch_idx+1}: Best score so far = {min(opt.yi)}")
+
+    best_idx = np.argmin(opt.yi)
+    print("\nBest configuration:")
+    print(f"  Params: {opt.Xi[best_idx]}")
+    print(f"  Best Epoch: {best_epochs[best_idx]}")
+    print(f"  Best Validation ELBO: {opt.yi[best_idx]}")
+

@@ -7,20 +7,20 @@ import gc
 
 from datetime import datetime
 
-from joblib import Parallel, delayed
-
-from skopt import Optimizer
-from skopt.space import Integer, Real, Categorical
-from skopt.utils import use_named_args
+#from joblib import Parallel, delayed
+#
+#from skopt import Optimizer
+#from skopt.space import Integer, Real, Categorical
+#from skopt.utils import use_named_args
 
 import wandb
 
-space = [
-    Integer(256, 2048, prior='log-uniform', name='k'),
-    Integer(16, 48, name='d'),
-    Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
-    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')
-]
+#space = [
+#    Integer(256, 2048, prior='log-uniform', name='k'),
+#    Integer(16, 48, name='d'),
+#    Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
+#    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')
+#]
 
 def sigmoid(x, clamp=False):
     if clamp:
@@ -242,8 +242,8 @@ def m_step(N=None,
     gc.collect()
     return initial_loss, final_loss
 
-@use_named_args(space)
-def objective(**params):
+#@use_named_args(space)
+def objective(params):
     run = wandb.init(
         project="flywrite1",
         resume="allow",
@@ -358,36 +358,50 @@ def objective(**params):
 
     return lowest_elbo, best_epoch
 
-if __name__ == "__main__":
-    # Set device
-    device = "cpu"
+#if __name__ == "__main__":
+#    # Set device
+#    device = "cpu"
+#
+#    n_batches = 1
+#    batch_size = 50
+#
+#    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+#
+#    for i in range(n_batches):
+#        candidates = opt.ask(n_points=batch_size)
+#
+#        if candidates is None:
+#            raise ValueError("opt.ask() returned None")
+#
+#        scores = Parallel(n_jobs=batch_size)(
+#            delayed(objective)(params) for params in candidates
+#        )
+#
+#        lowest_elbos, best_epochs = zip(*scores)
+#        
+#        opt.tell(candidates, lowest_elbos)
+#        print(f"All configurations: {opt.Xi}")
+#        print(f"Best Epochs: {best_epochs}")
+#        print(f"All scores: {opt.yi}")
+#        print(f"Batch {i+1}: Best score so far = {min(opt.yi)}")
+#
+#    # Best config
+#    best_idx = np.argmin(opt.yi)
+#    print("\nBest configuration:")
+#    print(f"  Params: {opt.Xi[best_idx]}")
+#    print(f"  Best Epoch: {best_epochs[best_idx]}")
+#    print(f"  Best Validation ELBO: {opt.yi[best_idx]}")
 
-    n_batches = 2
-    batch_size = 25
+import sys
+import json
 
-    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+task_id = int(sys.argv[1])
 
-    for i in range(n_batches):
-        candidates = opt.ask(n_points=batch_size)
+with open(f"configs/params_{task_id}.json") as f:
+    params = json.load(f)
 
-        if candidates is None:
-            raise ValueError("opt.ask() returned None")
+elbo, best_epoch = objective(params)
 
-        scores = Parallel(n_jobs=batch_size)(
-            delayed(objective)(params) for params in candidates
-        )
+with open(f"results/result_{task_id}.json", "w") as f:
+    json.dump({"elbo": elbo, "best_epoch": best_epoch}, f)
 
-        lowest_elbos, best_epochs = zip(*scores)
-        
-        opt.tell(candidates, lowest_elbos)
-        print(f"All configurations: {opt.Xi}")
-        print(f"Best Epochs: {best_epochs}")
-        print(f"All scores: {opt.yi}")
-        print(f"Batch {i+1}: Best score so far = {min(opt.yi)}")
-
-    # Best config
-    best_idx = np.argmin(opt.yi)
-    print("\nBest configuration:")
-    print(f"  Params: {opt.Xi[best_idx]}")
-    print(f"  Best Epoch: {best_epochs[best_idx]}")
-    print(f"  Best Validation ELBO: {opt.yi[best_idx]}")
