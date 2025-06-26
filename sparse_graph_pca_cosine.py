@@ -151,13 +151,6 @@ def orthogonalize(U):
     return Q
 
 
-#-----------------------------------------------------------------------------------------------#
-def cosine_distance(x, y):
-    x_norm = x / x.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    y_norm = y / y.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    return 1 - torch.mm(x_norm, y_norm.T) 
-#-----------------------------------------------------------------------------------------------#
-
 def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
     # Perform k-means clustering on the given data using PyTorch.
     n_samples, n_features = data.shape
@@ -165,11 +158,11 @@ def kmeans_clustering(data, n_clusters, max_iter=100, tol=1e-4, device="cuda"):
     indices = torch.randint(0, n_samples, (n_clusters,), device=device)
     cluster_centers = data[indices]
 
-    distances = cosine_distance(data, cluster_centers)
+    distances = torch.cdist(data, cluster_centers)
     labels = torch.argmin(distances, dim=1)
 
     for i in range(max_iter):
-        distances = cosine_distance(data, cluster_centers)
+        distances = torch.cdist(data, cluster_centers)
         labels = torch.argmin(distances, dim=1)
         del distances
         new_cluster_centers = torch.stack([
@@ -234,9 +227,10 @@ def objective(**params):
 
 
     X = adj_matrix.toarray()
+    X = csr_matrix(X_dense)
     labels_np = labels.detach().cpu().numpy()
     cluster_centers_original = np.vstack([
-        X[labels_np == i].mean(axis=0) if (labels_np == i).sum() > 0 else np.zeros(X.shape[1])
+        X[labels_np == i].sum(axis=0) / (labels == i).sum() if (labels_np == i).sum() > 0 else np.zeros(X.shape[1])
         for i in range(n_clusters)
     ])
 
