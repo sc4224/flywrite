@@ -44,38 +44,39 @@ def sanitize_json(obj):
         return obj
 
 if __name__ == "__main__":
-    opt = Optimizer(dimensions=space_list, base_estimator="GP", acq_func="EI", random_state=42)
+   os.system(f"sbatch --array=0-{batch_size-1} run_sbm.sh")
+   #  opt = Optimizer(dimensions=space_list, base_estimator="GP", acq_func="EI", random_state=42)
 
-    for batch_idx in range(n_batches):
-        candidates = opt.ask(n_points=batch_size)
+   #  for batch_idx in range(n_batches):
+   #      candidates = opt.ask(n_points=batch_size)
 
-        # Save candidates
-        os.makedirs("configs", exist_ok=True)
-        os.makedirs("results", exist_ok=True)
+   #      # Save candidates
+   #      os.makedirs("configs", exist_ok=True)
+   #      os.makedirs("results", exist_ok=True)
 
-        for i, params in enumerate(candidates):
-            params_dict = point_asdict(space_dict, params)
-            # Sanitize numpy types for JSON serialization
-            sanitized_params = {k: sanitize_json(v) for k, v in params_dict.items()}
-            with open(f"configs/params_{i}.json", "w") as f:
-                json.dump(sanitized_params, f)
+   #      for i, params in enumerate(candidates):
+   #          params_dict = point_asdict(space_dict, params)
+   #          # Sanitize numpy types for JSON serialization
+   #          sanitized_params = {k: sanitize_json(v) for k, v in params_dict.items()}
+   #          with open(f"configs/params_{i}.json", "w") as f:
+   #              json.dump(sanitized_params, f)
 
-        # Submit SLURM array job
-        os.system(f"sbatch --array=0-{batch_size-1} run_sbm.sh")
+   #      # Submit SLURM array job
+   #      os.system(f"sbatch --array=0-{batch_size-1} run_sbm.sh")
 
-        # Wait for results
-        wait_for_results(range(batch_size))
+   #      # Wait for results
+   #      wait_for_results(range(batch_size))
 
-        # Collect and use results
-        scores = load_results(range(batch_size))
-        lowest_elbos, best_epochs = zip(*scores)
+   #      # Collect and use results
+   #      scores = load_results(range(batch_size))
+   #      lowest_elbos, best_epochs = zip(*scores)
 
-        opt.tell(candidates, lowest_elbos)
-        print(f"Batch {batch_idx+1}: Best score so far = {min(opt.yi)}")
+   #      opt.tell(candidates, lowest_elbos)
+   #      print(f"Batch {batch_idx+1}: Best score so far = {min(opt.yi)}")
 
-    best_idx = np.argmin(opt.yi)
-    print("\nBest configuration:")
-    print(f"  Params: {opt.Xi[best_idx]}")
-    print(f"  Best Epoch: {best_epochs[best_idx]}")
-    print(f"  Best Validation ELBO: {opt.yi[best_idx]}")
+    # best_idx = np.argmin(opt.yi)
+    # print("\nBest configuration:")
+    # print(f"  Params: {opt.Xi[best_idx]}")
+    # print(f"  Best Epoch: {best_epochs[best_idx]}")
+    # print(f"  Best Validation ELBO: {opt.yi[best_idx]}")
 

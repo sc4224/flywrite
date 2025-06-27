@@ -11,7 +11,8 @@
 source ./sbmenv/bin/activate
 
 # Create log/output directories if they don't exist
-mkdir -p logs configs results
+# mkdir -p logs configs results
+mkdir -p logs credible_interval_results
 
 # Run your controller script
 python slurm_sbm.py

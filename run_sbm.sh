@@ -9,5 +9,5 @@
 
 source ./sbmenv/bin/activate
 
-python sbm.py $SLURM_ARRAY_TASK_ID
+python hidden_markov_graph.py $SLURM_ARRAY_TASK_ID
 
