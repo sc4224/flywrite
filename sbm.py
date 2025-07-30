@@ -17,7 +17,7 @@ import wandb
 
 #space = [
 #    Integer(256, 2048, prior='log-uniform', name='k'),
-#    Integer(16, 48, name='d'),
+#    Integer(16, 200, name='d'),
 #    Real(1e-4, 1e-2, prior='log-uniform', name='learning_rate'),
 #    Categorical(['Adam', 'AdamW', 'SGD'], name='optimizer')
 #]
@@ -245,7 +245,7 @@ def m_step(N=None,
 #@use_named_args(space)
 def objective(params):
     run = wandb.init(
-        project="flywrite1",
+        project="flywriteSBM6",
         resume="allow",
         reinit=True,           # allow multiple inits in the same process
         settings=wandb.Settings(start_method="thread")
@@ -254,13 +254,14 @@ def objective(params):
     K = params["k"]
     d = params["d"]
     lr = params["learning_rate"]
-    n_epochs = 5
+    n_epochs = 1000
     optimizer_choice = params["optimizer"]
     
     device = "cpu"
 
     # Set the global seed using torch
-    torch.manual_seed(int(datetime.now().timestamp()))
+    # torch.manual_seed(int(datetime.now().timestamp()))
+    torch.manual_seed(42)
 
     # Constants
     minibatch_size = 10_000

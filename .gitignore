@@ -14,3 +14,10 @@ iteration1
 iteration2
 runs
 vmog_runs
+results
+configs
+logs
+sbm_hyperparam_*
+sbmenv
+credible_interval_*
+pca_kmeans_*

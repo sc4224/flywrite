@@ -4,7 +4,7 @@ from scipy.sparse import csr_matrix, load_npz
 import numpy as np
 from tqdm import tqdm
 import gc
-
+import random
 from datetime import datetime
 
 device="cpu"
@@ -14,7 +14,8 @@ if torch.cuda.is_available():
     device="cuda"
 
 # set the global seed using torch. use the current time to make it more random.
-torch.manual_seed(int(datetime.now().timestamp()))
+# torch.manual_seed(int(datetime.now().timestamp()))
+torch.manual_seed(random.randint(1, 1000))
 
 # Constants
 K = 1859      # Number of clusters: 729
@@ -132,6 +133,8 @@ def m_step(n_max_updates=None, optimizer=None):
         # import ipdb; ipdb.set_trace()
         # Perform a gradient step
         optimizer.step()
+        del CC, e_prob, edge_weighted_KK, non_edge_weighted_KK, q_probs_batch_i, q_probs_batch_j, minibatch_indices_i, minibatch_indices_j
+        gc.collect()
     
     print(f"Initial loss: {initial_loss}, Final loss: {final_loss}")
 
