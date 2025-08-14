@@ -42,7 +42,7 @@ from index_mapping import load_mapping
 # ========================= User-editable hyperparameters =========================
 # Replace values as you wish. Keys are for the SBM-style model now (not PCA/GMM).
 best_params = {
-    'k': 128,                 # number of clusters
+    'k': 974,                 # number of clusters
     'learning_rate': 1e-2,
     'n_epochs': 500,
     'batch_edges': 4096,
