@@ -1,3 +1,406 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+from scipy.sparse import load_npz
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from sklearn.metrics import silhouette_score
+
+from skopt import Optimizer
+from skopt.space import Integer
+from skopt.utils import use_named_args
+
+import gc
+
+# -----------------------------
+# Search space (PCA removed)
+# -----------------------------
+# Only tune the number of GMM components (k).
+space = [
+    Integer(256, 1200, name='k'),
+]
+
+
+class BatchedEMGaussianMixture(nn.Module):
+    def __init__(self, n_components, n_features, max_iter=100, tol=1e-3, reg_covar=1e-6, device='cpu'):
+        """
+        PyTorch implementation of Gaussian Mixture Model with batched EM algorithm.
+        
+        Args:
+            n_components: Number of mixture components
+            n_features: Number of features/dimensions in the data
+            max_iter: Maximum number of EM iterations
+            tol: Tolerance for convergence
+            reg_covar: Regularization added to covariance matrices
+            device: Device to use ('cpu', 'cuda', or 'mps')
+        """
+        super(BatchedEMGaussianMixture, self).__init__()
+        
+        self.n_components = n_components
+        self.n_features = n_features
+        self.max_iter = max_iter
+        self.tol = tol
+        self.reg_covar = reg_covar
+        self.device = device
+        
+        # Learnable parameters (initialized in initialize_parameters)
+        # These are buffers, not parameters, as we update them via EM not gradient descent
+        self.register_buffer('means_', torch.zeros(n_components, n_features, device=device))
+        self.register_buffer('covs_', torch.zeros(n_components, n_features, n_features, device=device))
+        self.register_buffer('weights_', torch.ones(n_components, device=device) / n_components)
+        
+        # For diagonal covariance (more efficient)
+        self.register_buffer('log_vars_', torch.zeros(n_components, n_features, device=device))
+        
+        # For tracking
+        self.lower_bound_history_ = []
+        self.n_iter_ = 0
+        self.converged_ = False
+        
+        # For results
+        self.responsibilities_ = None
+        self.labels_ = None
+        
+    def initialize_parameters(self, X):
+        """Initialize GMM parameters, optionally using random subset for stability."""
+        n_samples = X.shape[0]
+        
+        # Random initialization
+        if n_samples > 10000:
+            # Sample a subset for more efficient initialization
+            indices = torch.randperm(n_samples)[:10000]
+            X_subset = X[indices]
+        else:
+            X_subset = X
+            
+        # Initialize means with random data points
+        indices = torch.randperm(len(X_subset))[:self.n_components]
+        self.means_ = X_subset[indices].clone()
+        
+        # Initialize with uniform weights
+        self.weights_ = torch.ones(self.n_components, device=self.device) / self.n_components
+        
+        # Estimate initial variances from data
+        data_var = torch.var(X_subset, dim=0)
+        self.log_vars_ = torch.log(data_var + self.reg_covar).repeat(self.n_components, 1)
+
+        # Clean up temporary tensors
+        del X_subset, indices, data_var
+
+        # Force garbage collection
+        gc.collect()
+        if self.device == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, 'mps') and self.device == 'mps':
+            torch.mps.empty_cache()
+
+    def e_step(self, X):
+        """E-step: Compute responsibilities (posterior probabilities)."""
+        n_samples = X.shape[0]
+        log_resp = torch.zeros(n_samples, self.n_components, device=X.device)
+        
+        # Compute log probabilities for each component
+        for k in range(self.n_components):
+            # Using diagonal covariance for efficiency
+            vars_k = torch.exp(self.log_vars_[k])
+            
+            # Compute log probabilities efficiently
+            diff = X - self.means_[k]
+            log_prob = -0.5 * (
+                torch.sum(torch.log(2 * np.pi * vars_k)) + 
+                torch.sum(diff**2 / vars_k.unsqueeze(0), dim=1)
+            )
+            
+            log_resp[:, k] = torch.log(self.weights_[k] + 1e-10) + log_prob
+            del diff, log_prob
+        
+        # Normalize (log-sum-exp trick for numerical stability)
+        log_resp_norm = torch.logsumexp(log_resp, dim=1, keepdim=True)
+        log_resp = log_resp - log_resp_norm
+        
+        # Convert to probabilities
+        resp = torch.exp(log_resp)
+
+        # Clean up device tensors
+        del log_resp, log_resp_norm
+        
+        # Force memory cleanup
+        if self.device == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, 'mps') and self.device == 'mps':
+            torch.mps.empty_cache()
+        
+        return resp
+    
+    def compute_lower_bound(self, X, resp):
+        """Compute the lower bound (ELBO) for current parameters."""
+        n_samples = X.shape[0]
+        lower_bound = 0.0
+        
+        # Log-likelihood contribution
+        for k in range(self.n_components):
+            vars_k = torch.exp(self.log_vars_[k])
+            
+            diff = X - self.means_[k]
+            log_prob = -0.5 * (
+                torch.sum(torch.log(2 * np.pi * vars_k)) + 
+                torch.sum(diff**2 / vars_k.unsqueeze(0), dim=1)
+            )
+            
+            lower_bound += torch.sum(
+                resp[:, k] * (torch.log(self.weights_[k] + 1e-10) + log_prob)
+            )
+            del vars_k, diff, log_prob
+        
+        # Entropy contribution
+        entropy = -torch.sum(resp * torch.log(resp + 1e-10))
+        lower_bound += entropy
+
+        # Clean up device tensors
+        del entropy
+        # Force cleanup
+        if self.device == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, 'mps') and self.device == 'mps':
+            torch.mps.empty_cache()
+        
+        return lower_bound / n_samples
+    
+    def fit(self, X, batch_size=1024, verbose=False):
+        """
+        Fit the GMM using batched EM algorithm.
+        
+        Args:
+            X: Input data tensor of shape (n_samples, n_features)
+            batch_size: Size of batches for processing
+            verbose: Whether to print progress
+            
+        Returns:
+            self: Fitted model
+        """
+        n_samples = X.shape[0]
+        
+        # Move data to the right device if needed
+        if X.device != self.device:
+            X = X.to(self.device)
+        
+        # Initialize parameters
+        self.initialize_parameters(X)
+        
+        # Store for convergence check
+        prev_lower_bound = -np.inf
+        prev_means = self.means_.clone()
+        
+        # Create data loader for batched processing
+        dataset = TensorDataset(X)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        for iteration in range(self.max_iter):
+            # Initialize accumulators for sufficient statistics
+            nk = torch.zeros(self.n_components, device=self.device)
+            means_numerator = torch.zeros_like(self.means_)
+            vars_numerator = torch.zeros_like(self.log_vars_)
+            
+            # For ELBO calculation
+            total_lower_bound = 0.0
+            
+            # Process batches
+            n_processed = 0
+            for batch_idx, (batch_X,) in enumerate(tqdm(loader, desc=f"EM Iteration {iteration+1}")):
+                batch_size_actual = batch_X.shape[0]
+                n_processed += batch_size_actual
+                
+                # E-step: compute responsibilities for this batch
+                with torch.no_grad():
+                    batch_resp = self.e_step(batch_X)
+                
+                # Accumulate statistics for M-step
+                batch_nk = torch.sum(batch_resp, dim=0)
+                nk += batch_nk
+                
+                # Means numerator: Σ_i r_ik * x_i
+                means_numerator += torch.matmul(batch_resp.T, batch_X)
+                
+                # Variances numerator: Σ_i r_ik * (x_i - μ_k)^2
+                for k in range(self.n_components):
+                    diff = batch_X - self.means_[k]
+                    # Weighted sum of squared differences
+                    weighted_diff_sq = batch_resp[:, k].unsqueeze(1) * diff**2
+                    vars_numerator[k] += torch.sum(weighted_diff_sq, dim=0)
+                    del diff, weighted_diff_sq
+                
+                # Contribution to lower bound
+                batch_lower_bound = self.compute_lower_bound(batch_X, batch_resp)
+                total_lower_bound += batch_lower_bound * batch_size_actual
+                
+                # Clean up between batches
+                del batch_resp, batch_nk
+                if hasattr(torch, 'mps') and torch.backends.mps.is_available() and self.device == 'mps':
+                    torch.mps.empty_cache()
+                elif torch.cuda.is_available() and self.device == 'cuda':
+                    torch.cuda.empty_cache()
+            
+            # M-step: update parameters using accumulated statistics
+            with torch.no_grad():
+                # Update means: μ_k = (Σ_i r_ik * x_i) / (Σ_i r_ik)
+                self.means_ = means_numerator / nk.unsqueeze(1)
+                
+                # Update variances: σ²_k = (Σ_i r_ik * (x_i - μ_k)²) / (Σ_i r_ik)
+                self.log_vars_ = torch.log(vars_numerator / nk.unsqueeze(1) + self.reg_covar)
+                
+                # Update weights: π_k = (Σ_i r_ik) / N
+                self.weights_ = nk / n_samples
+            
+            # Normalize lower bound
+            total_lower_bound /= n_samples
+            self.lower_bound_history_.append(total_lower_bound.item())
+            
+            if verbose:
+                print(f"Iteration {iteration+1}: Lower bound = {total_lower_bound.item():.4f}")
+            
+            # Check for convergence
+            if iteration > 0:
+                mean_change = torch.mean(torch.abs(self.means_ - prev_means))
+                lb_change = total_lower_bound - prev_lower_bound
+                
+                if verbose:
+                    print(f"Mean change: {mean_change.item():.6f}, LB change: {lb_change.item():.6f}")
+                
+                if (mean_change < self.tol or lb_change < self.tol) and lb_change >= 0:
+                    self.converged_ = True
+                    self.n_iter_ = iteration + 1
+                    if verbose:
+                        print(f"Converged after {self.n_iter_} iterations")
+                    break
+            
+            prev_lower_bound = total_lower_bound
+            prev_means = self.means_.clone()
+        
+        # If not converged, set final iteration count
+        if not self.converged_:
+            self.n_iter_ = self.max_iter
+            if verbose:
+                print(f"Did not converge after {self.max_iter} iterations")
+        
+        # Compute final responsibilities and labels in batches
+        self.responsibilities_ = torch.zeros(n_samples, self.n_components, device='cpu')
+        self.labels_ = torch.zeros(n_samples, dtype=torch.long, device='cpu')
+        
+        with torch.no_grad():
+            start_idx = 0
+            for batch_idx, (batch_X,) in enumerate(tqdm(loader, desc="Computing final assignments")):
+                batch_size_actual = batch_X.shape[0]
+                batch_resp = self.e_step(batch_X)
+                
+                # Move to CPU for storage (to save GPU memory)
+                self.responsibilities_[start_idx:start_idx+batch_size_actual] = batch_resp.cpu()
+                self.labels_[start_idx:start_idx+batch_size_actual] = torch.argmax(batch_resp, dim=1).cpu()
+                
+                start_idx += batch_size_actual
+        
+        # Analysis of clustering results (optional printouts)
+        unique_labels, counts = torch.unique(self.labels_, return_counts=True)
+        if verbose:
+            print(f"Found {len(unique_labels)} unique clusters out of {self.n_components} components")
+        
+        return self
+
+
+@use_named_args(space)
+def objective(**params):
+    """
+    Objective for Bayesian optimization (silhouette score).
+    PCA steps have been removed. We run GMM directly on the raw (dense) features.
+    """
+    n_mog_components = params["k"]
+
+    # Load the sparse matrix
+    file_path = "./sparse_connectivity_matrix.npz"
+    adj_matrix = load_npz(file_path)
+    print(f"Loaded sparse matrix with shape {adj_matrix.shape} and {adj_matrix.nnz} non-zero entries.")
+
+    # Convert to dense (NOTE: may be memory intensive depending on data size)
+    X_np = adj_matrix.toarray().astype(np.float32)
+    del adj_matrix
+    gc.collect()
+
+    # Create torch tensor
+    X = torch.tensor(X_np, dtype=torch.float32, device=device)
+
+    # Create and fit GMM directly on raw features
+    gmm_model = BatchedEMGaussianMixture(
+        n_components=n_mog_components,
+        n_features=X.shape[1],
+        max_iter=100,
+        tol=1e-4,
+        reg_covar=1e-6,
+        device=device
+    )
+
+    gmm_model.fit(X, batch_size=1024, verbose=True)
+
+    # Get labels - already computed during fitting
+    labels = gmm_model.labels_
+
+    # Compute the silhouette score (subsample if too large for speed/memory)
+    labels_np = labels.numpy()
+    max_samples_for_silhouette = 20000
+    if X_np.shape[0] > max_samples_for_silhouette:
+        idx = np.random.choice(X_np.shape[0], max_samples_for_silhouette, replace=False)
+        score = silhouette_score(X_np[idx], labels_np[idx])
+    else:
+        score = silhouette_score(X_np, labels_np)
+
+    # Cleanup
+    del labels, X, X_np
+    gc.collect()
+    if hasattr(torch, 'mps') and device == 'mps':
+        torch.mps.empty_cache()
+    if device == 'cuda' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Optimizer minimizes the objective, so return negative silhouette score.
+    return -score
+
+
+if __name__ == "__main__":
+    # Set device (global for objective)
+    device = "mps"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    # Basic optimizer loop (kept structure, defined missing vars)
+    n_batches = 3          # you can adjust
+    batch_size = 4         # number of candidates per batch
+
+    opt = Optimizer(dimensions=space, base_estimator="GP", acq_func="EI", random_state=42)
+
+    for i in range(n_batches):
+        candidates = opt.ask(n_points=batch_size)
+        if candidates is None:
+            raise ValueError("opt.ask() returned None")
+
+        scores = Parallel(n_jobs=batch_size)(
+            delayed(objective)(params) for params in candidates
+        )
+       
+        opt.tell(candidates, scores)
+        print(f"All scores so far = {opt.yi}")
+        print(f"Batch {i+1}: Best score so far = {-min(opt.yi):.4f}")
+
+    # Best config
+    best_idx = np.argmin(opt.yi)
+    print("\nBest configuration:")
+    print(f"  Params: {opt.Xi[best_idx]}")
+    print(f"  Silhouette Score: {-opt.yi[best_idx]:.4f}")
+=======
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
