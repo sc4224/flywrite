@@ -1,5 +1,3 @@
-<<<<<<< HEAD
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -734,4 +732,3 @@ if __name__ == "__main__":
     plt.savefig("vmog_runs/confusion_matrix.png")
     plt.show()
     print("[INFO] Saved to vmog_runs/confusion_matrix.png")
->>>>>>> f3731bef05177212f5f802a3812cb3498d6c738e
