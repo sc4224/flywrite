@@ -21,3 +21,4 @@ sbm_hyperparam_*
 sbmenv
 credible_interval_*
 pca_kmeans_*
+.DS_Store
